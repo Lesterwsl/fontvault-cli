@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-readonly FONTVAULT_VERSION="1.0.0"
+readonly FONTVAULT_VERSION="1.0.1"
 readonly FONTVAULT_LABEL="com.lesterwsl.fontvault"
 
 export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
@@ -95,6 +95,71 @@ is_font_file() {
 
 sha256_file() {
   shasum -a 256 "$1" | awk '{ print $1 }'
+}
+
+backup_lock_is_active() {
+  local lock_dir="$1"
+  local pid_file="$lock_dir/pid"
+  local lock_pid="" modified_at="" now="" age=""
+
+  [[ -d "$lock_dir" ]] || return 1
+  if [[ -r "$pid_file" ]]; then
+    lock_pid="$(<"$pid_file")"
+    if [[ "$lock_pid" == <-> ]] && kill -0 "$lock_pid" 2>/dev/null; then
+      return 0
+    fi
+    return 1
+  fi
+
+  # A second process can observe the directory just before the owner writes its
+  # PID. Treat a metadata-free lock as active briefly, but recover it afterward.
+  modified_at="$(stat -f %m "$lock_dir" 2>/dev/null || true)"
+  now="$(date +%s)"
+  if [[ "$modified_at" == <-> ]]; then
+    age=$(( now - modified_at ))
+    (( age < 30 )) && return 0
+  fi
+  return 1
+}
+
+acquire_backup_lock() {
+  local lock_dir="$1"
+  local stale_dir existing_pid=""
+
+  if ! mkdir "$lock_dir" 2>/dev/null; then
+    if backup_lock_is_active "$lock_dir"; then
+      [[ -r "$lock_dir/pid" ]] && existing_pid="$(<"$lock_dir/pid")"
+      if [[ -n "$existing_pid" ]]; then
+        die "Another backup is already running (PID $existing_pid). / 另一個備份正在執行（PID $existing_pid）。"
+      fi
+      die "Another backup is starting; try again shortly. / 另一個備份正在啟動，請稍後再試。"
+    fi
+
+    stale_dir="$lock_dir.stale.$$"
+    if ! mv "$lock_dir" "$stale_dir" 2>/dev/null; then
+      die "Backup lock changed while checking; try again. / 檢查期間備份鎖定已改變，請再試一次。"
+    fi
+    rm -f -- "$stale_dir/pid" "$stale_dir/started_at" "$stale_dir/command"
+    rmdir "$stale_dir" 2>/dev/null ||
+      die "Stale backup lock contains unexpected files: $stale_dir / 失效備份鎖定含有非預期檔案。"
+    mkdir "$lock_dir" 2>/dev/null ||
+      die "Another backup started while recovering the stale lock. / 清理失效鎖定時另一個備份已開始。"
+    print 'Recovered a stale backup lock. / 已自動清理失效的備份鎖定。'
+  fi
+
+  printf '%s\n' "$$" > "$lock_dir/pid"
+  date -u '+%Y-%m-%dT%H:%M:%SZ' > "$lock_dir/started_at"
+  printf '%s\n' "fontvault backup" > "$lock_dir/command"
+}
+
+release_backup_lock() {
+  local lock_dir="$1"
+  local lock_pid=""
+  [[ -d "$lock_dir" ]] || return 0
+  [[ -r "$lock_dir/pid" ]] && lock_pid="$(<"$lock_dir/pid")"
+  [[ "$lock_pid" == "$$" ]] || return 0
+  rm -f -- "$lock_dir/pid" "$lock_dir/started_at" "$lock_dir/command"
+  rmdir "$lock_dir" 2>/dev/null || true
 }
 
 is_interactive() {
@@ -597,15 +662,15 @@ command_backup() {
     die "Not enough temporary disk space for a safe snapshot. / 臨時磁碟空間不足，無法安全建立快照。"
   fi
 
-  mkdir "$BACKUP_LOCK_DIR" 2>/dev/null || die "Another backup is already running. / 另一個備份正在執行。"
+  cleanup_backup() {
+    [[ -n "$BACKUP_STAGE_DIR" && -d "$BACKUP_STAGE_DIR" ]] && rm -rf "$BACKUP_STAGE_DIR"
+    [[ -n "$BACKUP_LOCK_DIR" ]] && release_backup_lock "$BACKUP_LOCK_DIR"
+  }
+  acquire_backup_lock "$BACKUP_LOCK_DIR"
+  trap cleanup_backup EXIT INT TERM HUP
 
   BACKUP_STAGE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/fontvault.XXXXXX")"
   local stage_dir="$BACKUP_STAGE_DIR"
-  cleanup_backup() {
-    [[ -n "$BACKUP_STAGE_DIR" && -d "$BACKUP_STAGE_DIR" ]] && rm -rf "$BACKUP_STAGE_DIR"
-    [[ -n "$BACKUP_LOCK_DIR" && -d "$BACKUP_LOCK_DIR" ]] && rmdir "$BACKUP_LOCK_DIR" 2>/dev/null || true
-  }
-  trap cleanup_backup EXIT INT TERM HUP
 
   mkdir -p \
     "$stage_dir/homebrew" \

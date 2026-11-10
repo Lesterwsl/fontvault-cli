@@ -6,7 +6,28 @@
 It deliberately excludes macOS-managed and Homebrew-managed font binaries. Homebrew font casks are saved as reinstall commands instead.  
 它會排除 macOS 與 Homebrew 管理的字型二進位檔，並改為保存 Homebrew 字型 cask 的重裝指令。
 
-## Install / 安裝
+## What is backed up / 會備份甚麼
+
+| Item / 項目 | Backup behavior / 備份方式 |
+|---|---|
+| Personal fonts in `~/Library/Fonts` / `~/Library/Fonts` 的個人字型 | The actual `.ttf`, `.ttc`, `.otf`, `.otc`, and `.dfont` files are copied after macOS, Homebrew, duplicate, empty, and unreadable files are excluded. / 排除 macOS、Homebrew、重複、空白及無法讀取的檔案後，複製實際字型檔。 |
+| Shared fonts in `/Library/Fonts` / `/Library/Fonts` 的共用字型 | Not included by default; copied only with `--include-shared` or an enabled setting. / 預設不包含；只有使用 `--include-shared` 或啟用設定時才複製。 |
+| Homebrew / Homebrew | A restorable `Brewfile`, a font-cask-only Brewfile, and a readable package/version list are saved. Homebrew font binaries are not copied. / 保存可還原的 `Brewfile`、只含字型 cask 的 Brewfile，以及易讀套件與版本清單；不複製 Homebrew 字型檔。 |
+| Applications / 應用程式 | Names, versions, and detected sources from `/Applications` and `~/Applications` are saved as Markdown. App bundles are not copied. / 將 `/Applications` 與 `~/Applications` 的名稱、版本及偵測來源保存為 Markdown；不複製 app bundle。 |
+| Font manifests / 字型清單 | SHA-256 hashes, classification results, and Homebrew font reinstall commands are saved. / 保存 SHA-256、分類結果及 Homebrew 字型重裝指令。 |
+
+### What is not backed up / 不會備份甚麼
+
+- macOS-managed font binaries and everything in `/System/Library/Fonts`; matching copies found in user locations are also excluded.<br>
+  macOS 管理的字型檔及 `/System/Library/Fonts` 內所有內容均不會備份；使用者位置中的相同副本亦會排除。
+- Homebrew-managed font binaries; the relevant cask reinstall commands are saved instead.<br>
+  Homebrew 管理的字型檔不會備份，改為保存相關 cask 重裝指令。
+- Application binaries, application data, preferences, documents, system applications, and iCloud data.<br>
+  不會備份應用程式本體、app 資料、偏好設定、文件、系統應用程式或 iCloud 資料。
+- Passwords, GitHub tokens, SSH private keys, cookies, one-time codes, or other credentials.<br>
+  不會保存密碼、GitHub token、SSH 私密金鑰、cookie、一次性代碼或其他憑證。
+
+## Install on this Mac / 在目前的 Mac 安裝
 
 ```bash
 brew install Lesterwsl/tap/fontvault
@@ -37,28 +58,22 @@ fontvault doctor                    # validate dependencies, Git, and schedule
 
 ## New Mac setup / 新 Mac 設定
 
-No password, token, SSH private key, or one-time login code is stored in the CLI, tap, configuration, or backup repository. The GitHub username and repository name are safe to provide as command arguments.  
+No password, token, SSH private key, or one-time login code is stored in the CLI, tap, configuration, or backup repository. The GitHub username and repository name are safe to provide as command arguments.<br>
 CLI、tap、設定及備份 repository 都不會保存密碼、token、SSH 私密金鑰或一次性登入代碼；GitHub 使用者名稱及 repository 名稱則可安全作為指令參數。
 
-On a new Mac, first install Homebrew from [brew.sh](https://brew.sh/), then run:  
+On a new Mac, first install Homebrew from [brew.sh](https://brew.sh/), then run:<br>
 在新 Mac 上，先從 [brew.sh](https://brew.sh/) 安裝 Homebrew，再執行：
 
 ```bash
 brew install Lesterwsl/tap/fontvault
 fontvault setup --account Lesterwsl --repo-name mac-font-backup
-```
-
-`fontvault setup` checks Homebrew, Git, GitHub CLI, `jq`, authentication, private-repository access, and the destination path. If GitHub authentication is missing, it offers to start the official browser-based `gh auth login` flow; the password is entered only through GitHub's own secure interface. It clones the private repository only after confirmation and does not start restoration automatically.  
-`fontvault setup` 會檢查 Homebrew、Git、GitHub CLI、`jq`、登入狀態、私人 repository 存取權及目的路徑。若尚未登入，它只會詢問是否啟動官方瀏覽器 `gh auth login` 流程；密碼只會在 GitHub 自己的安全介面輸入。程式會先取得確認才 clone 私人 repository，亦不會自動開始還原。
-
-Review the environment and restore plan before making changes:  
-實際變更前先檢查環境及還原計劃：
-
-```bash
 fontvault doctor
 fontvault status
 fontvault restore all
 ```
+
+`fontvault` installs GitHub CLI and the other required command-line dependencies through the Homebrew formula. `fontvault setup` then checks the tools, starts the official browser-based `gh auth login` flow if needed, verifies private-repository access, and asks before cloning. `doctor` and `status` let you review the new Mac before the separate `restore all` confirmation.<br>
+Homebrew formula 會連同 GitHub CLI 及其他必要指令工具安裝 `fontvault`。之後 `fontvault setup` 會檢查工具、需要時啟動官方瀏覽器 `gh auth login` 流程、驗證私人 repository 權限，並在 clone 前詢問。你可先用 `doctor` 及 `status` 檢查新 Mac，再於獨立的 `restore all` 確認中開始還原。
 
 ## Classification / 分類方式
 
@@ -105,6 +120,6 @@ Identical font files are skipped automatically because no change is required. No
 fontvault restore all --non-interactive
 ```
 
-The backup also stops safely for unresolved Git conflicts, insufficient temporary disk space, files of 100 MB or more, and a remote branch that contains commits missing locally. If the network or credentials fail after a commit, the local commit is retained for a later push.  
-遇到未解決 Git 衝突、臨時空間不足、單檔達 100 MB，或遠端含本機沒有的 commit 時，備份會安全停止；若 commit 後網路或憑證失敗，本機 commit 會保留，供稍後再次 push。
+The backup also stops safely for an active backup process, unresolved Git conflicts, insufficient temporary disk space, files of 100 MB or more, and a remote branch that contains commits missing locally. The lock records its owning process and is automatically recovered if that process no longer exists. If the network or credentials fail after a commit, the local commit is retained for a later push.<br>
+遇到仍在執行的備份程序、未解決 Git 衝突、臨時空間不足、單檔達 100 MB，或遠端含本機沒有的 commit 時，備份會安全停止。鎖定會記錄所屬程序；若該程序已不存在，便會自動復原。若 commit 後網路或憑證失敗，本機 commit 會保留，供稍後再次 push。
 
