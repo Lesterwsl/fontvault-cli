@@ -1,0 +1,1232 @@
+#!/bin/zsh
+
+set -euo pipefail
+
+readonly FONTVAULT_VERSION="1.0.0"
+readonly FONTVAULT_LABEL="com.lesterwsl.fontvault"
+
+export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+export GIT_TERMINAL_PROMPT=0
+export HOMEBREW_NO_AUTO_UPDATE=1
+
+readonly CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/fontvault"
+readonly CONFIG_FILE="$CONFIG_DIR/config"
+readonly CACHE_DIR="${XDG_CACHE_HOME:-$HOME/Library/Caches}/fontvault"
+readonly LOG_DIR="$HOME/Library/Logs"
+
+REPO_PATH="${FONTVAULT_REPO:-}"
+INCLUDE_SHARED_FONTS=false
+BACKUP_STAGE_DIR=""
+BACKUP_LOCK_DIR=""
+MENU_RESULT=""
+MENU_STTY=""
+
+if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
+  readonly C_RESET=$'\033[0m'
+  readonly C_BOLD=$'\033[1m'
+  readonly C_CYAN=$'\033[36m'
+  readonly C_GREEN=$'\033[32m'
+  readonly C_YELLOW=$'\033[33m'
+  readonly C_DIM=$'\033[2m'
+else
+  readonly C_RESET="" C_BOLD="" C_CYAN="" C_GREEN="" C_YELLOW="" C_DIM=""
+fi
+
+usage() {
+  cat <<'EOF'
+fontvault — macOS font, Homebrew, and application inventory backup
+
+Usage:
+  fontvault init --repo PATH
+  fontvault setup [--account USER] [--repo-name NAME] [--path PATH]
+  fontvault backup [--dry-run|--local|--commit|--push] [--include-shared]
+  fontvault status
+  fontvault doctor
+  fontvault restore [fonts|homebrew|all] [--overwrite|--skip-existing] [--shared]
+                    [--non-interactive] [--upgrade-homebrew] [--yes]
+  fontvault schedule [--daily HH:MM]
+  fontvault unschedule
+  fontvault apps
+  fontvault homebrew
+  fontvault logs [--errors]
+  fontvault version
+
+用法：
+  fontvault init --repo 路徑
+  fontvault backup [--dry-run|--local|--commit|--push] [--include-shared]
+  fontvault status | doctor | restore | schedule | unschedule | apps | homebrew | logs
+EOF
+}
+
+die() {
+  print -u2 -r -- "$*"
+  exit 1
+}
+
+require_command() {
+  command -v "$1" >/dev/null 2>&1 || die "Required command not found / 找不到必要指令: $1"
+}
+
+load_config() {
+  if [[ -f "$CONFIG_FILE" ]]; then
+    source "$CONFIG_FILE"
+  fi
+  REPO_PATH="${FONTVAULT_REPO:-${REPO_PATH:-$HOME/mac-font-backup}}"
+  REPO_PATH="${REPO_PATH:A}"
+}
+
+ensure_macos() {
+  [[ "$(uname -s)" == "Darwin" ]] || die "fontvault supports macOS only. / fontvault 只支援 macOS。"
+}
+
+ensure_repo() {
+  load_config
+  [[ -d "$REPO_PATH" ]] || die "Backup repository not found: $REPO_PATH\nRun: fontvault init --repo PATH"
+  git -C "$REPO_PATH" rev-parse --is-inside-work-tree >/dev/null 2>&1 ||
+    die "Not a Git repository / 不是 Git repository: $REPO_PATH"
+}
+
+is_font_file() {
+  case "${1:l}" in
+    *.dfont|*.otc|*.otf|*.ttc|*.ttf) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+sha256_file() {
+  shasum -a 256 "$1" | awk '{ print $1 }'
+}
+
+is_interactive() {
+  [[ -t 0 && -t 1 ]]
+}
+
+menu_cleanup() {
+  printf '\033[?25h' >&2 2>/dev/null || true
+  if [[ -n "$MENU_STTY" ]]; then
+    stty "$MENU_STTY" 2>/dev/null || stty sane 2>/dev/null || true
+  fi
+  tput rmcup >&2 2>/dev/null || true
+  MENU_STTY=""
+}
+
+interactive_select() {
+  local title="$1"
+  shift
+  local -a items=("$@")
+  local selected=1 total=${#items[@]} key second third i
+  (( total > 0 )) || return 1
+
+  MENU_STTY="$(stty -g 2>/dev/null || true)"
+  tput smcup >&2 2>/dev/null || true
+  stty -echo -icanon 2>/dev/null || true
+  printf '\033[?25l' >&2
+  trap 'menu_cleanup; exit 130' INT TERM
+  trap 'menu_cleanup' EXIT
+
+  while true; do
+    printf '\033[H\033[2J' >&2
+    printf '%s%sfontvault%s  %s%s%s\n' "$C_BOLD" "$C_CYAN" "$C_RESET" "$C_DIM" "$FONTVAULT_VERSION" "$C_RESET" >&2
+    printf '%s%s%s\n\n' "$C_BOLD" "$title" "$C_RESET" >&2
+    for (( i = 1; i <= total; i++ )); do
+      if (( i == selected )); then
+        printf '  %s▶%s %s%d. %s%s\n' "$C_CYAN" "$C_RESET" "$C_BOLD" "$i" "${items[$i]}" "$C_RESET" >&2
+      else
+        printf '    %d. %s\n' "$i" "${items[$i]}" >&2
+      fi
+    done
+    printf '\n%s↑/↓ or j/k navigate · Enter select · q quit%s\n' "$C_DIM" "$C_RESET" >&2
+
+    IFS= read -r -k 1 key || key="q"
+    case "$key" in
+      $'\033')
+        IFS= read -r -k 1 -t 0.1 second || second=""
+        IFS= read -r -k 1 -t 0.1 third || third=""
+        if [[ "$second$third" == "[A" ]]; then
+          (( selected > 1 )) && (( selected -= 1 ))
+        elif [[ "$second$third" == "[B" ]]; then
+          (( selected < total )) && (( selected += 1 ))
+        fi
+        ;;
+      k) (( selected > 1 )) && (( selected -= 1 )) ;;
+      j) (( selected < total )) && (( selected += 1 )) ;;
+      q|Q)
+        MENU_RESULT="0"
+        menu_cleanup
+        trap - EXIT INT TERM
+        return 1
+        ;;
+      $'\r'|$'\n'|'')
+        MENU_RESULT="$selected"
+        menu_cleanup
+        trap - EXIT INT TERM
+        return 0
+        ;;
+      [1-9])
+        if (( key <= total )); then
+          MENU_RESULT="$key"
+          menu_cleanup
+          trap - EXIT INT TERM
+          return 0
+        fi
+        ;;
+    esac
+  done
+}
+
+pause_for_menu() {
+  is_interactive || return 0
+  print
+  read -r "?Press Enter to return to the menu. / 按 Enter 返回選單。"
+}
+
+command_menu() {
+  ensure_macos
+  local -a main_items=(
+    'Back up now / 立即備份'
+    'Preview backup / 預覽備份'
+    'Status dashboard / 狀態總覽'
+    'Application inventory / 應用程式清單'
+    'Homebrew inventory / Homebrew 清單'
+    'Restore to this Mac / 還原至此 Mac'
+    'Schedule automatic backup / 設定自動備份'
+    'New Mac setup and doctor / 新 Mac 設定與檢查'
+    'View logs / 查看記錄'
+    'Quit / 離開'
+  )
+
+  while true; do
+    if ! interactive_select 'Mac backup and restore / Mac 備份與還原' "${main_items[@]}"; then
+      return 0
+    fi
+    case "$MENU_RESULT" in
+      1)
+        print "${C_BOLD}Backup preview / 備份預覽${C_RESET}"
+        if command_backup --dry-run && prompt_yes_no 'Create, commit, and push this backup? / 建立、commit 並 push 此備份？'; then
+          command_backup || true
+        else
+          print 'Backup cancelled after preview. / 已在預覽後取消備份。'
+        fi
+        ;;
+      2) command_backup --dry-run || true ;;
+      3) command_status || true ;;
+      4) command_apps || true ;;
+      5) command_homebrew || true ;;
+      6)
+        local -a restore_items=(
+          'Fonts only / 只還原字型'
+          'Homebrew only / 只還原 Homebrew'
+          'Everything / 全部還原'
+          'Cancel / 取消'
+        )
+        if interactive_select 'Choose restore scope / 選擇還原範圍' "${restore_items[@]}"; then
+          case "$MENU_RESULT" in
+            1) command_restore fonts || true ;;
+            2) command_restore homebrew || true ;;
+            3) command_restore all || true ;;
+          esac
+        fi
+        ;;
+      7)
+        local schedule_time
+        read -r "schedule_time?Daily time / 每日時間 [03:00]: "
+        schedule_time="${schedule_time:-03:00}"
+        if prompt_yes_no "Install daily schedule at $schedule_time? / 安裝每日 $schedule_time 排程？"; then
+          command_schedule --daily "$schedule_time" || true
+        fi
+        ;;
+      8)
+        if ! command_doctor; then
+          print
+          if prompt_yes_no 'Run guided setup? / 執行設定導引？'; then
+            command_setup || true
+          fi
+        fi
+        ;;
+      9)
+        if [[ -f "$LOG_DIR/fontvault.log" ]]; then
+          command_logs || true
+        else
+          print 'No fontvault log exists yet. / 尚未有 fontvault 記錄。'
+        fi
+        ;;
+      10) return 0 ;;
+    esac
+    pause_for_menu
+  done
+}
+
+md_escape() {
+  local value="$1"
+  value="${value//\\/\\\\}"
+  value="${value//|/\\|}"
+  value="${value//$'\t'/ }"
+  value="${value//$'\n'/ }"
+  print -r -- "$value"
+}
+
+command_init() {
+  ensure_macos
+  local requested_repo=""
+  while (( $# > 0 )); do
+    case "$1" in
+      --repo)
+        (( $# >= 2 )) || die "--repo requires a path. / --repo 需要路徑。"
+        requested_repo="$2"
+        shift
+        ;;
+      -h|--help)
+        print "Usage: fontvault init --repo PATH"
+        return 0
+        ;;
+      *) die "Unknown init option / 不明 init 選項: $1" ;;
+    esac
+    shift
+  done
+
+  [[ -n "$requested_repo" ]] || requested_repo="$HOME/mac-font-backup"
+  requested_repo="${requested_repo:A}"
+  [[ -d "$requested_repo" ]] || die "Repository directory not found / 找不到 repository: $requested_repo"
+  git -C "$requested_repo" rev-parse --is-inside-work-tree >/dev/null 2>&1 ||
+    die "Not a Git repository / 不是 Git repository: $requested_repo"
+
+  mkdir -p "$CONFIG_DIR"
+  {
+    printf '# fontvault user configuration / fontvault 使用者設定\n'
+    printf 'REPO_PATH=%q\n' "$requested_repo"
+    printf 'INCLUDE_SHARED_FONTS=false\n'
+  } > "$CONFIG_FILE"
+  chmod 0600 "$CONFIG_FILE"
+
+  print "Configured repository: $requested_repo"
+  print "已設定備份 repository：$requested_repo"
+}
+
+prompt_yes_no() {
+  local prompt="$1"
+  local answer
+  is_interactive || return 1
+  read -r "answer?$prompt [y/N]: "
+  [[ "${answer:l}" == "y" || "${answer:l}" == "yes" ]]
+}
+
+print_homebrew_setup_guide() {
+  cat <<'EOF'
+Homebrew is required but was not found. Install it from the official Homebrew site, then continue:
+需要 Homebrew，但目前找不到。請從 Homebrew 官方網站安裝，再繼續：
+
+  https://brew.sh/
+
+After Homebrew is installed / 安裝 Homebrew 後：
+
+  brew install Lesterwsl/tap/fontvault
+  fontvault setup --account Lesterwsl --repo-name mac-font-backup
+EOF
+}
+
+command_setup() {
+  ensure_macos
+  local account="Lesterwsl"
+  local repo_name="mac-font-backup"
+  local requested_path="$HOME/mac-font-backup"
+  local non_interactive=false
+
+  while (( $# > 0 )); do
+    case "$1" in
+      --account)
+        (( $# >= 2 )) || die "--account requires a GitHub username. / --account 需要 GitHub 使用者名稱。"
+        account="$2"
+        shift
+        ;;
+      --repo-name)
+        (( $# >= 2 )) || die "--repo-name requires a name. / --repo-name 需要名稱。"
+        repo_name="$2"
+        shift
+        ;;
+      --path)
+        (( $# >= 2 )) || die "--path requires a directory. / --path 需要資料夾。"
+        requested_path="$2"
+        shift
+        ;;
+      --non-interactive) non_interactive=true ;;
+      *) die "Unknown setup option / 不明 setup 選項: $1" ;;
+    esac
+    shift
+  done
+  requested_path="${requested_path:A}"
+
+  if ! command -v brew >/dev/null 2>&1; then
+    print_homebrew_setup_guide
+    return 2
+  fi
+
+  local missing_tools=()
+  command -v git >/dev/null 2>&1 || missing_tools+=(git)
+  command -v gh >/dev/null 2>&1 || missing_tools+=(gh)
+  command -v jq >/dev/null 2>&1 || missing_tools+=(jq)
+  if (( ${#missing_tools[@]} > 0 )); then
+    print "Missing tools / 缺少工具：${(j:, :)missing_tools}"
+    print "Install them with / 使用以下指令安裝：brew install ${(j: :)missing_tools}"
+    return 2
+  fi
+
+  if ! gh auth status >/dev/null 2>&1; then
+    print 'GitHub CLI is not authenticated. No password or token will be stored in the repository.'
+    print 'GitHub CLI 尚未登入；密碼及 token 不會寫入 repository。'
+    print 'Secure login command / 安全登入指令：'
+    print '  gh auth login --hostname github.com --git-protocol https --web'
+    if ! $non_interactive && prompt_yes_no 'Start the secure GitHub CLI login now? / 現在啟動 GitHub CLI 安全登入？'; then
+      gh auth login --hostname github.com --git-protocol https --web
+    else
+      print 'Complete GitHub CLI login, then run fontvault setup again.'
+      print '請完成 GitHub CLI 登入，再重新執行 fontvault setup。'
+      return 2
+    fi
+  fi
+  gh auth setup-git >/dev/null
+
+  if [[ ! -e "$requested_path" ]]; then
+    print "Private repository to clone / 將 clone 私人 repository：$account/$repo_name"
+    print "Destination / 目的地：$requested_path"
+    if $non_interactive || prompt_yes_no 'Clone this private repository? / Clone 此私人 repository？'; then
+      gh repo clone "$account/$repo_name" "$requested_path"
+    else
+      print 'Setup cancelled before cloning. / 已在 clone 前取消設定。'
+      return 2
+    fi
+  fi
+
+  [[ -d "$requested_path" ]] || die "Repository path is unavailable / Repository 路徑不可用: $requested_path"
+  git -C "$requested_path" rev-parse --is-inside-work-tree >/dev/null 2>&1 ||
+    die "The destination exists but is not a Git repository. / 目的地存在但不是 Git repository。"
+  git -C "$requested_path" remote get-url origin >/dev/null 2>&1 ||
+    die "The repository has no origin remote. / Repository 沒有 origin remote。"
+  if ! git -C "$requested_path" ls-remote origin HEAD >/dev/null 2>&1; then
+    die "GitHub repository access failed. Run 'gh auth login' and try again. / 無法存取 GitHub repository；請登入後重試。"
+  fi
+
+  command_init --repo "$requested_path"
+  print
+  print 'Environment setup is complete. Review the plan before restoring:'
+  print '環境設定完成；還原前請先檢查計劃：'
+  print '  fontvault doctor'
+  print '  fontvault status'
+  print '  fontvault restore all'
+}
+
+build_system_font_cache() {
+  local build_version cache_file temp_cache root font_file checksum
+  build_version="$(sw_vers -buildVersion | tr -cd '[:alnum:]._-')"
+  mkdir -p "$CACHE_DIR"
+  cache_file="$CACHE_DIR/system-fonts-$build_version.tsv"
+
+  if [[ ! -s "$cache_file" ]]; then
+    temp_cache="$(mktemp "$CACHE_DIR/system-fonts.XXXXXX")"
+    : > "$temp_cache"
+    local -a system_roots=(
+      "/System/Library/Fonts"
+      "/System/Library/AssetsV2"
+      "/System/Library/PrivateFrameworks/FontServices.framework"
+    )
+    for root in "${system_roots[@]}"; do
+      [[ -d "$root" ]] || continue
+      while IFS= read -r -d '' font_file; do
+        is_font_file "$font_file" || continue
+        checksum="$(sha256_file "$font_file")"
+        printf '%s\t%s\n' "$checksum" "$font_file" >> "$temp_cache"
+      done < <(find "$root" -type f -print0 2>/dev/null)
+    done
+    LC_ALL=C sort -u "$temp_cache" > "$cache_file"
+    rm "$temp_cache"
+  fi
+  print -r -- "$cache_file"
+}
+
+write_homebrew_markdown() {
+  local formula_versions="$1"
+  local cask_versions="$2"
+  local output_file="$3"
+  local name versions
+  local formula_count cask_count
+  formula_count="$(wc -l < "$formula_versions" | tr -d ' ')"
+  cask_count="$(wc -l < "$cask_versions" | tr -d ' ')"
+
+  {
+    print '# Homebrew inventory / Homebrew 清單'
+    print
+    print 'This is a reference list. Use the accompanying `Brewfile` for restoration.'
+    print '這是參考清單；還原時請使用同一資料夾內的 `Brewfile`。'
+    print
+    print '```bash'
+    print 'brew bundle --file ./font-backup-data/homebrew/Brewfile'
+    print '```'
+    print
+    printf '## Formulae (%s) / Formula (%s)\n\n' "$formula_count" "$formula_count"
+    print '| Name / 名稱 | Version / 版本 |'
+    print '|---|---|'
+    while IFS=' ' read -r name versions; do
+      [[ -n "$name" ]] || continue
+      printf '| %s | %s |\n' "$(md_escape "$name")" "$(md_escape "${versions:-unknown}")"
+    done < "$formula_versions"
+    print
+    printf '## Casks (%s) / Cask (%s)\n\n' "$cask_count" "$cask_count"
+    print '| Name / 名稱 | Version / 版本 |'
+    print '|---|---|'
+    while IFS=' ' read -r name versions; do
+      [[ -n "$name" ]] || continue
+      printf '| %s | %s |\n' "$(md_escape "$name")" "$(md_escape "${versions:-unknown}")"
+    done < "$cask_versions"
+  } > "$output_file"
+}
+
+write_applications_markdown() {
+  local app_rows="$1"
+  local output_file="$2"
+  local app_count name version source
+  app_count="$(wc -l < "$app_rows" | tr -d ' ')"
+  {
+    print '# Installed applications / 已安裝應用程式'
+    print
+    print 'Names only are needed for migration; versions and detected sources are included as reference.'
+    print '搬機時只需參考名稱；版本及偵測到的來源亦一併列出。'
+    print
+    print 'macOS system applications under `/System/Applications` are excluded.'
+    print '已排除 `/System/Applications` 內的 macOS 系統應用程式。'
+    print
+    printf '## Applications (%s) / 應用程式 (%s)\n\n' "$app_count" "$app_count"
+    print '| Application / 應用程式 | Version / 版本 | Source / 來源 |'
+    print '|---|---|---|'
+    while IFS=$'\t' read -r name version source; do
+      [[ -n "$name" ]] || continue
+      printf '| %s | %s | %s |\n' \
+        "$(md_escape "$name")" "$(md_escape "${version:-unknown}")" "$(md_escape "$source")"
+    done < "$app_rows"
+  } > "$output_file"
+}
+
+write_font_report() {
+  local classification_file="$1"
+  local font_casks_file="$2"
+  local system_inventory="$3"
+  local output_file="$4"
+  local personal_count homebrew_count system_duplicate_count duplicate_count invalid_count system_reference_count
+  local kind relative_path bytes checksum token full_token
+  personal_count="$(awk -F '\t' '$1 == "personal" { count++ } END { print count + 0 }' "$classification_file")"
+  homebrew_count="$(awk -F '\t' '$1 == "homebrew" { count++ } END { print count + 0 }' "$classification_file")"
+  system_duplicate_count="$(awk -F '\t' '$1 == "system" { count++ } END { print count + 0 }' "$classification_file")"
+  duplicate_count="$(awk -F '\t' '$1 == "duplicate" { count++ } END { print count + 0 }' "$classification_file")"
+  invalid_count="$(awk -F '\t' '$1 == "invalid" { count++ } END { print count + 0 }' "$classification_file")"
+  system_reference_count="$(awk -F '\t' '!seen[$1]++ { count++ } END { print count + 0 }' "$system_inventory")"
+
+  {
+    print '# Font classification / 字型分類'
+    print
+    print 'The backup uses file paths and SHA-256 fingerprints to exclude Homebrew-managed and macOS-managed fonts.'
+    print '備份會使用檔案路徑及 SHA-256 指紋排除 Homebrew 與 macOS 管理的字型。'
+    print
+    printf -- '- Personal fonts backed up / 已備份個人字型：%s\n' "$personal_count"
+    printf -- '- Homebrew font files excluded / 已排除 Homebrew 字型檔：%s\n' "$homebrew_count"
+    printf -- '- macOS font copies excluded / 已排除 macOS 字型副本：%s\n' "$system_duplicate_count"
+    printf -- '- Duplicate font files excluded / 已排除重複字型檔：%s\n' "$duplicate_count"
+    printf -- '- Unreadable or empty files skipped / 已略過無法讀取或空白檔案：%s\n' "$invalid_count"
+    printf -- '- macOS-managed reference fingerprints / macOS 管理字型指紋：%s\n' "$system_reference_count"
+    print
+    print '## Homebrew font reinstall commands / Homebrew 字型重裝指令'
+    print
+    print '| Cask | Install command / 安裝指令 |'
+    print '|---|---|'
+    while IFS=$'\t' read -r token full_token; do
+      [[ -n "$token" ]] || continue
+      printf '| `%s` | `brew install --cask %s` |\n' "$token" "$full_token"
+    done < "$font_casks_file"
+    print
+    print '## Personal font files / 個人字型檔'
+    print
+    print '| File / 檔案 | Size / 大小 (bytes) | SHA-256 |'
+    print '|---|---:|---|'
+    while IFS=$'\t' read -r kind relative_path bytes checksum; do
+      [[ "$kind" == "personal" ]] || continue
+      printf '| %s | %s | `%s` |\n' "$(md_escape "$relative_path")" "$bytes" "$checksum"
+    done < "$classification_file"
+  } > "$output_file"
+}
+
+command_backup() {
+  ensure_macos
+  ensure_repo
+  require_command brew
+  require_command git
+  require_command jq
+  require_command rsync
+
+  local dry_run=false commit_changes=true push_changes=true include_shared="$INCLUDE_SHARED_FONTS"
+  while (( $# > 0 )); do
+    case "$1" in
+      --dry-run) dry_run=true; commit_changes=false; push_changes=false ;;
+      --local) commit_changes=false; push_changes=false ;;
+      --commit) commit_changes=true; push_changes=false ;;
+      --push) commit_changes=true; push_changes=true ;;
+      --include-shared) include_shared=true ;;
+      -h|--help)
+        print 'Usage: fontvault backup [--dry-run|--local|--commit|--push] [--include-shared]'
+        return 0
+        ;;
+      *) die "Unknown backup option / 不明 backup 選項: $1" ;;
+    esac
+    shift
+  done
+
+  local data_dir="$REPO_PATH/font-backup-data"
+  BACKUP_LOCK_DIR="$REPO_PATH/.fontvault.lock"
+  if git -C "$REPO_PATH" diff --name-only --diff-filter=U | grep -q .; then
+    die "Git has unresolved conflicts; resolve them before backup. / Git 尚有未解決衝突，請先處理。"
+  fi
+  if $commit_changes || $push_changes; then
+    git -C "$REPO_PATH" remote get-url origin >/dev/null 2>&1 ||
+      die "Git origin is not configured. / 尚未設定 Git origin。"
+  fi
+  if [[ -n "$(git -C "$REPO_PATH" status --porcelain --untracked-files=no -- . ':!font-backup-data')" ]]; then
+    print -u2 "Warning: unrelated repository changes are present; they will not be committed."
+    print -u2 "警告：repository 有其他變更；它們不會被加入 commit。"
+  fi
+
+  local required_kb available_kb
+  required_kb="$(du -sk "$HOME/Library/Fonts" 2>/dev/null | awk '{ print $1 + 102400 }')"
+  available_kb="$(df -Pk "${TMPDIR:-/tmp}" | awk 'NR == 2 { print $4 }')"
+  if [[ -n "$required_kb" && -n "$available_kb" ]] && (( available_kb < required_kb )); then
+    die "Not enough temporary disk space for a safe snapshot. / 臨時磁碟空間不足，無法安全建立快照。"
+  fi
+
+  mkdir "$BACKUP_LOCK_DIR" 2>/dev/null || die "Another backup is already running. / 另一個備份正在執行。"
+
+  BACKUP_STAGE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/fontvault.XXXXXX")"
+  local stage_dir="$BACKUP_STAGE_DIR"
+  cleanup_backup() {
+    [[ -n "$BACKUP_STAGE_DIR" && -d "$BACKUP_STAGE_DIR" ]] && rm -rf "$BACKUP_STAGE_DIR"
+    [[ -n "$BACKUP_LOCK_DIR" && -d "$BACKUP_LOCK_DIR" ]] && rmdir "$BACKUP_LOCK_DIR" 2>/dev/null || true
+  }
+  trap cleanup_backup EXIT INT TERM HUP
+
+  mkdir -p \
+    "$stage_dir/homebrew" \
+    "$stage_dir/applications" \
+    "$stage_dir/fonts/user" \
+    "$stage_dir/manifests"
+
+  local metadata_json="$stage_dir/homebrew-installed.json"
+  brew info --json=v2 --installed > "$metadata_json"
+
+  local font_casks="$stage_dir/font-casks.tsv"
+  jq -r '
+    .casks[] |
+    (.artifacts // [] | map(select(type == "object" and has("font")))) as $font_artifacts |
+    select((.token | startswith("font-")) or ($font_artifacts | length > 0)) |
+    [.token, (.full_token // .token)] | @tsv
+  ' "$metadata_json" | LC_ALL=C sort -u > "$font_casks"
+
+  local font_targets="$stage_dir/font-targets.tsv"
+  jq -r '
+    .casks[] |
+    (.artifacts // [])[]? |
+    select(type == "object" and has("font") and .target != null) |
+    .target
+  ' "$metadata_json" | LC_ALL=C sort -u > "$font_targets"
+
+  local app_targets="$stage_dir/app-targets.tsv"
+  jq -r '
+    .casks[] | .token as $token |
+    (.artifacts // [])[]? |
+    select(type == "object" and has("app") and .target != null) |
+    [.target, $token] | @tsv
+  ' "$metadata_json" | LC_ALL=C sort -u > "$app_targets"
+
+  local full_brewfile="$stage_dir/homebrew/Brewfile"
+  brew bundle dump --file="$full_brewfile" --force --no-describe
+
+  local font_brewfile="$stage_dir/homebrew/Brewfile.fonts"
+  : > "$font_brewfile"
+  local token full_token
+  while IFS=$'\t' read -r token full_token; do
+    [[ -n "$token" ]] || continue
+    printf 'cask "%s"\n' "$full_token" >> "$font_brewfile"
+  done < "$font_casks"
+
+  local formula_versions="$stage_dir/formula-versions.txt"
+  local cask_versions="$stage_dir/cask-versions.txt"
+  brew list --formula --versions | LC_ALL=C sort -f > "$formula_versions"
+  brew list --cask --versions | LC_ALL=C sort -f > "$cask_versions"
+  write_homebrew_markdown "$formula_versions" "$cask_versions" "$stage_dir/homebrew/homebrew.md"
+
+  typeset -A brew_targets_map brew_hashes system_hashes brew_app_map personal_hashes
+  local target_path checksum caskroom cask_root font_file
+  while IFS= read -r target_path; do
+    [[ -n "$target_path" ]] || continue
+    brew_targets_map[$target_path]=1
+    if [[ -f "$target_path" ]] && is_font_file "$target_path"; then
+      brew_hashes[$(sha256_file "$target_path")]=1
+    fi
+  done < "$font_targets"
+
+  caskroom="$(brew --caskroom)"
+  while IFS=$'\t' read -r token full_token; do
+    [[ -n "$token" ]] || continue
+    cask_root="$caskroom/$token"
+    [[ -d "$cask_root" ]] || continue
+    while IFS= read -r -d '' font_file; do
+      is_font_file "$font_file" || continue
+      brew_hashes[$(sha256_file "$font_file")]=1
+    done < <(find "$cask_root" -type f -print0 2>/dev/null)
+  done < "$font_casks"
+
+  local system_cache
+  system_cache="$(build_system_font_cache)"
+  while IFS=$'\t' read -r checksum target_path; do
+    [[ -n "$checksum" ]] && system_hashes[$checksum]=1
+  done < "$system_cache"
+  {
+    printf 'path\tsha256\n'
+    while IFS=$'\t' read -r checksum target_path; do
+      printf '%s\t%s\n' "$target_path" "$checksum"
+    done < "$system_cache"
+  } > "$stage_dir/manifests/macos-system-fonts.tsv"
+
+  while IFS=$'\t' read -r target_path token; do
+    [[ -n "$target_path" ]] && brew_app_map[$target_path]="$token"
+  done < "$app_targets"
+
+  local app_rows="$stage_dir/application-rows.tsv"
+  : > "$app_rows"
+  local app_root app_path resolved_path app_name app_version app_source info_plist
+  for app_root in /Applications "$HOME/Applications"; do
+    [[ -d "$app_root" ]] || continue
+    while IFS= read -r -d '' app_path; do
+      resolved_path="${app_path:A}"
+      [[ "$resolved_path" == /System/Applications/* ]] && continue
+      app_name="${app_path:t:r}"
+      info_plist="$app_path/Contents/Info.plist"
+      app_version="$(plutil -extract CFBundleShortVersionString raw -o - "$info_plist" 2>/dev/null || true)"
+      [[ -n "$app_version" ]] || app_version="$(plutil -extract CFBundleVersion raw -o - "$info_plist" 2>/dev/null || true)"
+      [[ -n "$app_version" ]] || app_version="unknown"
+      if [[ -n "${brew_app_map[$app_path]-}" ]]; then
+        app_source="Homebrew (${brew_app_map[$app_path]})"
+      elif [[ -f "$app_path/Contents/_MASReceipt/receipt" ]]; then
+        app_source="Mac App Store"
+      else
+        app_source="Other / 其他"
+      fi
+      printf '%s\t%s\t%s\n' "$app_name" "$app_version" "$app_source" >> "$app_rows"
+    done < <(find "$app_root" -maxdepth 3 -type d -name '*.app' -prune -print0 2>/dev/null)
+  done
+  LC_ALL=C sort -f -u "$app_rows" -o "$app_rows"
+  write_applications_markdown "$app_rows" "$stage_dir/applications/applications.md"
+
+  local classification="$stage_dir/classification.tsv"
+  : > "$classification"
+  local source_root destination_root source_label relative_path destination_file bytes kind
+
+  classify_font_root() {
+    source_root="$1"
+    destination_root="$2"
+    source_label="$3"
+    [[ -d "$source_root" ]] || return 0
+    while IFS= read -r -d '' font_file; do
+      is_font_file "$font_file" || continue
+      if [[ ! -r "$font_file" || ! -s "$font_file" ]]; then
+        relative_path="$source_label/${font_file#$source_root/}"
+        printf 'invalid\t%s\t0\t-\n' "$relative_path" >> "$classification"
+        continue
+      fi
+      checksum="$(sha256_file "$font_file")"
+      relative_path="$source_label/${font_file#$source_root/}"
+      bytes="$(stat -f '%z' "$font_file")"
+      if [[ -n "${brew_targets_map[$font_file]-}" || -n "${brew_hashes[$checksum]-}" ]]; then
+        kind="homebrew"
+      elif [[ -n "${system_hashes[$checksum]-}" ]]; then
+        kind="system"
+      elif [[ -n "${personal_hashes[$checksum]-}" ]]; then
+        kind="duplicate"
+      else
+        kind="personal"
+        personal_hashes[$checksum]=1
+        destination_file="$destination_root/${font_file#$source_root/}"
+        mkdir -p "${destination_file:h}"
+        cp -p "$font_file" "$destination_file"
+        chmod 0644 "$destination_file"
+      fi
+      printf '%s\t%s\t%s\t%s\n' "$kind" "$relative_path" "$bytes" "$checksum" >> "$classification"
+    done < <(find "$source_root" -type f -print0 2>/dev/null)
+  }
+
+  classify_font_root "$HOME/Library/Fonts" "$stage_dir/fonts/user" "user"
+  if $include_shared; then
+    mkdir -p "$stage_dir/fonts/shared"
+    classify_font_root "/Library/Fonts" "$stage_dir/fonts/shared" "shared"
+  fi
+  LC_ALL=C sort -u "$classification" -o "$classification"
+
+  {
+    printf 'category\tpath\tbytes\tsha256\n'
+    awk -F '\t' '$1 == "personal" { print }' "$classification"
+  } > "$stage_dir/manifests/fonts.tsv"
+  write_font_report "$classification" "$font_casks" "$system_cache" "$stage_dir/manifests/font-classification.md"
+
+  local oversized=false
+  while IFS= read -r -d '' font_file; do
+    bytes="$(stat -f '%z' "$font_file")"
+    if (( bytes >= 100000000 )); then
+      print -u2 "Font exceeds GitHub's 100 MB Git-object limit: ${font_file#$stage_dir/fonts/}"
+      print -u2 "字型超過 GitHub 的 100 MB Git object 上限：${font_file#$stage_dir/fonts/}"
+      oversized=true
+    fi
+  done < <(find "$stage_dir/fonts" -type f -print0)
+  $oversized && die "Configure Git LFS before backing up these files. / 請先設定 Git LFS。"
+
+  local brew_count personal_count homebrew_excluded system_excluded duplicate_count invalid_count app_count user_size shared_size
+  brew_count="$(wc -l < "$font_casks" | tr -d ' ')"
+  personal_count="$(awk -F '\t' '$1 == "personal" { count++ } END { print count + 0 }' "$classification")"
+  homebrew_excluded="$(awk -F '\t' '$1 == "homebrew" { count++ } END { print count + 0 }' "$classification")"
+  system_excluded="$(awk -F '\t' '$1 == "system" { count++ } END { print count + 0 }' "$classification")"
+  duplicate_count="$(awk -F '\t' '$1 == "duplicate" { count++ } END { print count + 0 }' "$classification")"
+  invalid_count="$(awk -F '\t' '$1 == "invalid" { count++ } END { print count + 0 }' "$classification")"
+  app_count="$(wc -l < "$app_rows" | tr -d ' ')"
+  user_size="$(du -sh "$stage_dir/fonts/user" | awk '{ print $1 }')"
+  shared_size="0B"
+  [[ -d "$stage_dir/fonts/shared" ]] && shared_size="$(du -sh "$stage_dir/fonts/shared" | awk '{ print $1 }')"
+
+  printf 'Homebrew font casks / Homebrew 字型套件：%s\n' "$brew_count"
+  printf 'Homebrew font files excluded / 已排除 Homebrew 字型檔：%s\n' "$homebrew_excluded"
+  printf 'macOS font copies excluded / 已排除 macOS 字型副本：%s\n' "$system_excluded"
+  printf 'Duplicate font files excluded / 已排除重複字型檔：%s\n' "$duplicate_count"
+  printf 'Unreadable or empty font files skipped / 已略過無法讀取或空白字型檔：%s\n' "$invalid_count"
+  printf 'Personal fonts backed up / 已備份個人字型：%s (%s)\n' "$personal_count" "$user_size"
+  printf 'Shared backup size / 共用字型備份大小：%s\n' "$shared_size"
+  printf 'Applications inventoried / 已列出應用程式：%s\n' "$app_count"
+
+  if $dry_run; then
+    print 'Dry run complete; repository unchanged. / 試跑完成；repository 未被修改。'
+    return 0
+  fi
+
+  mkdir -p "$data_dir/homebrew" "$data_dir/applications" "$data_dir/fonts/user" "$data_dir/manifests"
+  rsync -a --delete "$stage_dir/homebrew/" "$data_dir/homebrew/"
+  rsync -a --delete "$stage_dir/applications/" "$data_dir/applications/"
+  rsync -a --delete "$stage_dir/fonts/user/" "$data_dir/fonts/user/"
+  rsync -a --delete "$stage_dir/manifests/" "$data_dir/manifests/"
+  if $include_shared; then
+    mkdir -p "$data_dir/fonts/shared"
+    rsync -a --delete "$stage_dir/fonts/shared/" "$data_dir/fonts/shared/"
+  fi
+
+  print "Backup updated: $data_dir"
+  print "備份已更新：$data_dir"
+
+  if $commit_changes; then
+    git -C "$REPO_PATH" add -- font-backup-data
+    if git -C "$REPO_PATH" diff --cached --quiet -- font-backup-data; then
+      print 'No inventory changes; no commit created. / 清單沒有變更，因此不建立 commit。'
+    else
+      local commit_time
+      commit_time="$(date '+%Y-%m-%d %H:%M:%S %z')"
+      git -C "$REPO_PATH" commit -m "chore(backup): font, Homebrew, and app inventory $commit_time" -- font-backup-data
+    fi
+  fi
+
+  if $push_changes; then
+    local push_output branch_name behind_count ahead_count
+    if ! push_output="$(git -C "$REPO_PATH" fetch origin 2>&1)"; then
+      print -u2 -r -- "$push_output"
+      print -u2 'Backup is committed locally but fetch failed; retry when online. / 備份已在本機 commit，但 fetch 失敗；請連線後重試。'
+      return 1
+    fi
+    branch_name="$(git -C "$REPO_PATH" branch --show-current)"
+    if [[ -n "$branch_name" ]] && git -C "$REPO_PATH" rev-parse --verify "origin/$branch_name" >/dev/null 2>&1; then
+      read -r behind_count ahead_count <<< "$(git -C "$REPO_PATH" rev-list --left-right --count "origin/$branch_name...HEAD")"
+      if (( behind_count > 0 )); then
+        print -u2 "Remote has $behind_count commit(s) not present locally; no push was attempted."
+        print -u2 "遠端有 $behind_count 個本機沒有的 commit；未嘗試 push。"
+        print -u2 'Review and integrate the remote changes, then run fontvault backup again.'
+        return 1
+      fi
+    fi
+    if push_output="$(git -C "$REPO_PATH" push 2>&1)"; then
+      [[ -n "$push_output" ]] && print -r -- "$push_output"
+    else
+      print -u2 -r -- "$push_output"
+      return 1
+    fi
+    print 'Backup pushed to origin. / 備份已推送至 origin。'
+  fi
+}
+
+brewfile_existing_counts() {
+  local brewfile="$1"
+  local record_type package_name short_name
+  local formula_count=0 cask_count=0 missing_count=0
+  while IFS=$'\t' read -r record_type package_name; do
+    [[ -n "$package_name" ]] || continue
+    short_name="${package_name##*/}"
+    if [[ "$record_type" == "brew" ]]; then
+      if brew list --formula --versions "$short_name" >/dev/null 2>&1; then
+        (( formula_count += 1 ))
+      else
+        (( missing_count += 1 ))
+      fi
+    else
+      if brew list --cask --versions "$short_name" >/dev/null 2>&1; then
+        (( cask_count += 1 ))
+      else
+        (( missing_count += 1 ))
+      fi
+    fi
+  done < <(sed -nE 's/^brew "([^"]+)".*/brew\t\1/p; s/^cask "([^"]+)".*/cask\t\1/p' "$brewfile")
+  printf '%s\t%s\t%s\n' "$formula_count" "$cask_count" "$missing_count"
+}
+
+restore_homebrew_bundle() {
+  local brewfile="$1"
+  local conflict_policy="$2"
+  local existing_formulae existing_casks missing_count choice
+  read -r existing_formulae existing_casks missing_count <<< "$(brewfile_existing_counts "$brewfile")"
+
+  if (( existing_formulae + existing_casks > 0 )); then
+    print "Already installed / 已安裝：$existing_formulae formula(e), $existing_casks cask(s)"
+    print "Missing / 尚未安裝：$missing_count"
+    if [[ "$conflict_policy" == "ask" ]] && is_interactive; then
+      print 'Homebrew conflicts: [k] keep installed and install missing (recommended), [u] allow upgrades, [r] reinstall listed installed packages, [q] cancel'
+      print 'Homebrew 衝突：[k] 保留現有並只安裝缺少項目（建議）、[u] 允許升級、[r] 重裝已列項目、[q] 取消'
+      read -r "choice?Choice / 選擇 [k/u/r/q]: "
+      case "${choice:l}" in
+        k|'') conflict_policy="skip" ;;
+        u) conflict_policy="upgrade" ;;
+        r) conflict_policy="reinstall" ;;
+        q) return 2 ;;
+        *) print -u2 'Invalid choice; restore cancelled. / 選擇無效，已取消還原。'; return 2 ;;
+      esac
+    elif [[ "$conflict_policy" == "ask" ]]; then
+      conflict_policy="skip"
+      print 'Non-interactive mode: keeping installed packages. / 非互動模式：保留已安裝套件。'
+    fi
+  fi
+
+  case "$conflict_policy" in
+    skip|ask) brew bundle --file="$brewfile" --no-upgrade ;;
+    upgrade) brew bundle --file="$brewfile" ;;
+    reinstall)
+      brew bundle --file="$brewfile" --no-upgrade
+      local record_type package_name short_name
+      while IFS=$'\t' read -r record_type package_name; do
+        [[ -n "$package_name" ]] || continue
+        short_name="${package_name##*/}"
+        if [[ "$record_type" == "brew" ]] && brew list --formula --versions "$short_name" >/dev/null 2>&1; then
+          brew reinstall "$package_name"
+        elif [[ "$record_type" == "cask" ]] && brew list --cask --versions "$short_name" >/dev/null 2>&1; then
+          brew reinstall --cask "$package_name"
+        fi
+      done < <(sed -nE 's/^brew "([^"]+)".*/brew\t\1/p; s/^cask "([^"]+)".*/cask\t\1/p' "$brewfile")
+      ;;
+    *) die "Invalid Homebrew conflict policy: $conflict_policy" ;;
+  esac
+}
+
+restore_font_tree() {
+  local source_root="$1"
+  local destination_root="$2"
+  local use_sudo="$3"
+  local conflict_policy="$4"
+  local source_file relative_path destination_file source_hash destination_hash choice action
+  local installed=0 identical=0 kept=0 replaced=0
+  [[ -d "$source_root" ]] || return 0
+
+  while IFS= read -r -d '' source_file; do
+    relative_path="${source_file#$source_root/}"
+    destination_file="$destination_root/$relative_path"
+    if [[ ! -e "$destination_file" ]]; then
+      if $use_sudo; then
+        sudo mkdir -p "${destination_file:h}"
+        sudo cp -p "$source_file" "$destination_file"
+      else
+        mkdir -p "${destination_file:h}"
+        cp -p "$source_file" "$destination_file"
+      fi
+      (( installed += 1 ))
+      continue
+    fi
+
+    source_hash="$(sha256_file "$source_file")"
+    destination_hash="$(sha256_file "$destination_file" 2>/dev/null || print '-')"
+    if [[ "$source_hash" == "$destination_hash" ]]; then
+      (( identical += 1 ))
+      continue
+    fi
+
+    action="$conflict_policy"
+    if [[ "$action" == "ask" ]] && is_interactive; then
+      print "Font conflict / 字型衝突: $destination_file"
+      print '[k] keep, [o] overwrite, [K] keep all, [O] overwrite all, [q] cancel'
+      print '[k] 保留、[o] 覆蓋、[K] 全部保留、[O] 全部覆蓋、[q] 取消'
+      read -r "choice?Choice / 選擇: "
+      case "$choice" in
+        k|'') action="skip" ;;
+        o) action="overwrite" ;;
+        K) action="skip"; conflict_policy="skip" ;;
+        O) action="overwrite"; conflict_policy="overwrite" ;;
+        q) return 2 ;;
+        *) print -u2 'Invalid choice; keeping existing font. / 選擇無效，保留現有字型。'; action="skip" ;;
+      esac
+    elif [[ "$action" == "ask" ]]; then
+      action="skip"
+    fi
+
+    if [[ "$action" == "overwrite" ]]; then
+      if $use_sudo; then
+        sudo cp -p "$source_file" "$destination_file"
+      else
+        cp -p "$source_file" "$destination_file"
+      fi
+      (( replaced += 1 ))
+    else
+      (( kept += 1 ))
+    fi
+  done < <(find "$source_root" -type f -print0)
+
+  print "Fonts installed / 已安裝字型：$installed; identical / 相同：$identical; kept / 保留：$kept; replaced / 覆蓋：$replaced"
+}
+
+command_status() {
+  ensure_repo
+  local data_dir="$REPO_PATH/font-backup-data"
+  local font_count=0 app_count=0 brew_count=0 backup_size="0B" schedule_status="not installed"
+  [[ -f "$data_dir/manifests/fonts.tsv" ]] && font_count="$(awk 'NR > 1 { count++ } END { print count + 0 }' "$data_dir/manifests/fonts.tsv")"
+  [[ -f "$data_dir/applications/applications.md" ]] && app_count="$(grep -c '^| ' "$data_dir/applications/applications.md" | awk '{ print ($1 >= 1 ? $1 - 1 : 0) }')"
+  [[ -f "$data_dir/homebrew/Brewfile.fonts" ]] && brew_count="$(grep -c '^cask ' "$data_dir/homebrew/Brewfile.fonts" || true)"
+  [[ -d "$data_dir/fonts" ]] && backup_size="$(du -sh "$data_dir/fonts" | awk '{ print $1 }')"
+  if launchctl print "gui/$(id -u)/$FONTVAULT_LABEL" >/dev/null 2>&1; then
+    schedule_status="installed"
+  fi
+
+  print "Repository / Repository：$REPO_PATH"
+  print "Personal font files / 個人字型檔：$font_count"
+  print "Homebrew font casks / Homebrew 字型套件：$brew_count"
+  print "Applications / 應用程式：$app_count"
+  print "Font backup size / 字型備份大小：$backup_size"
+  print "Schedule / 排程：$schedule_status"
+  git -C "$REPO_PATH" status --short --branch
+  if git -C "$REPO_PATH" rev-parse --verify HEAD >/dev/null 2>&1; then
+    git -C "$REPO_PATH" log -1 --oneline --decorate
+  else
+    print 'No commits yet. / 尚未有 commit。'
+  fi
+}
+
+command_doctor() {
+  ensure_macos
+  local failures=0 command_name
+  for command_name in brew git jq rsync shasum plutil launchctl; do
+    if command -v "$command_name" >/dev/null 2>&1; then
+      printf '✓ %s\n' "$command_name"
+    else
+      printf '✗ %s\n' "$command_name"
+      (( failures += 1 ))
+    fi
+  done
+  load_config
+  if [[ -d "$REPO_PATH" ]] && git -C "$REPO_PATH" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    print "✓ repository: $REPO_PATH"
+  else
+    print "✗ repository: $REPO_PATH"
+    (( failures += 1 ))
+  fi
+  if git -C "$REPO_PATH" remote get-url origin >/dev/null 2>&1; then
+    print '✓ Git origin'
+  else
+    print '✗ Git origin'
+    (( failures += 1 ))
+  fi
+  if command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
+    print '✓ GitHub authentication / GitHub 登入'
+  else
+    print '! GitHub authentication unavailable / GitHub 登入不可用'
+  fi
+  if launchctl print "gui/$(id -u)/$FONTVAULT_LABEL" >/dev/null 2>&1; then
+    print '✓ automatic schedule / 自動排程'
+  else
+    print '! automatic schedule not installed / 尚未安裝自動排程'
+  fi
+  (( failures == 0 )) || return 1
+}
+
+command_restore() {
+  ensure_macos
+  ensure_repo
+  require_command brew
+  require_command rsync
+  local mode="fonts" restore_shared=false conflict_policy="ask" homebrew_policy="ask" assume_yes=false non_interactive=false
+  if (( $# > 0 )) && [[ "$1" != --* ]]; then
+    mode="$1"
+    shift
+  fi
+  [[ "$mode" == "fonts" || "$mode" == "homebrew" || "$mode" == "all" ]] ||
+    die "Restore mode must be fonts, homebrew, or all. / 還原模式必須是 fonts、homebrew 或 all。"
+  while (( $# > 0 )); do
+    case "$1" in
+      --overwrite) conflict_policy="overwrite" ;;
+      --skip-existing) conflict_policy="skip"; homebrew_policy="skip" ;;
+      --non-interactive) non_interactive=true; assume_yes=true; conflict_policy="skip"; homebrew_policy="skip" ;;
+      --upgrade-homebrew) homebrew_policy="upgrade" ;;
+      --yes) assume_yes=true ;;
+      --shared) restore_shared=true ;;
+      *) die "Unknown restore option / 不明 restore 選項: $1" ;;
+    esac
+    shift
+  done
+
+  local data_dir="$REPO_PATH/font-backup-data"
+  [[ -d "$data_dir" ]] || die "Backup data not found. / 找不到備份資料。"
+  if [[ "$(git -C "$REPO_PATH" remote get-url origin 2>/dev/null || true)" == *github.com* ]]; then
+    if ! command -v gh >/dev/null 2>&1 || ! gh auth status >/dev/null 2>&1; then
+      print -u2 'GitHub CLI authentication is unavailable. Local restore can continue, but future pulls and backups will fail.'
+      print -u2 'GitHub CLI 登入不可用；本機還原仍可繼續，但日後 pull 與備份會失敗。'
+      print -u2 'Run: gh auth login --hostname github.com --git-protocol https --web'
+      if ! $assume_yes && ! prompt_yes_no 'Continue with local restore only? / 只進行本機還原？'; then
+        return 2
+      fi
+    fi
+  fi
+
+  print "Restore mode / 還原模式：$mode"
+  print "Repository / Repository：$REPO_PATH"
+  print "Font conflict policy / 字型衝突處理：$conflict_policy"
+  print "Homebrew conflict policy / Homebrew 衝突處理：$homebrew_policy"
+  if ! $assume_yes && is_interactive; then
+    prompt_yes_no 'Proceed with restore? / 繼續還原？' || return 2
+  fi
+  if [[ "$mode" == "homebrew" || "$mode" == "all" ]]; then
+    [[ -s "$data_dir/homebrew/Brewfile" ]] || die "Full Brewfile not found. / 找不到完整 Brewfile。"
+    restore_homebrew_bundle "$data_dir/homebrew/Brewfile" "$homebrew_policy" || return $?
+  elif [[ -s "$data_dir/homebrew/Brewfile.fonts" ]]; then
+    restore_homebrew_bundle "$data_dir/homebrew/Brewfile.fonts" "$homebrew_policy" || return $?
+  fi
+
+  if [[ "$mode" == "fonts" || "$mode" == "all" ]]; then
+    mkdir -p "$HOME/Library/Fonts"
+    restore_font_tree "$data_dir/fonts/user" "$HOME/Library/Fonts" false "$conflict_policy" || return $?
+    if $restore_shared && [[ -d "$data_dir/fonts/shared" ]]; then
+      sudo mkdir -p /Library/Fonts
+      restore_font_tree "$data_dir/fonts/shared" "/Library/Fonts" true "$conflict_policy" || return $?
+    fi
+  fi
+  print 'Restore complete. Reopen applications to refresh fonts. / 還原完成；請重新開啟應用程式。'
+}
+
+command_schedule() {
+  ensure_macos
+  ensure_repo
+  local schedule_time="03:00"
+  while (( $# > 0 )); do
+    case "$1" in
+      --daily)
+        (( $# >= 2 )) || die "--daily requires HH:MM. / --daily 需要 HH:MM。"
+        schedule_time="$2"
+        shift
+        ;;
+      *) die "Unknown schedule option / 不明 schedule 選項: $1" ;;
+    esac
+    shift
+  done
+  [[ "$schedule_time" == <0-23>:<0-59> ]] || die "Invalid time / 無效時間: $schedule_time"
+  local hour="${schedule_time%%:*}" minute="${schedule_time##*:}"
+  local plist="$HOME/Library/LaunchAgents/$FONTVAULT_LABEL.plist"
+  local program_path
+  program_path="$(command -v fontvault 2>/dev/null || true)"
+  [[ -n "$program_path" ]] || program_path="${0:A}"
+  local escaped_program escaped_log_dir
+  escaped_program="$(printf '%s' "$program_path" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g')"
+  escaped_log_dir="$(printf '%s' "$LOG_DIR" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g')"
+  mkdir -p "$HOME/Library/LaunchAgents" "$LOG_DIR"
+  cat > "$plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$FONTVAULT_LABEL</string>
+  <key>ProgramArguments</key>
+  <array><string>$escaped_program</string><string>backup</string></array>
+  <key>StartCalendarInterval</key>
+  <dict><key>Hour</key><integer>$hour</integer><key>Minute</key><integer>$minute</integer></dict>
+  <key>RunAtLoad</key><true/>
+  <key>StandardOutPath</key><string>$escaped_log_dir/fontvault.log</string>
+  <key>StandardErrorPath</key><string>$escaped_log_dir/fontvault.error.log</string>
+</dict>
+</plist>
+EOF
+  plutil -lint "$plist" >/dev/null
+  launchctl bootout "gui/$(id -u)/$FONTVAULT_LABEL" 2>/dev/null || true
+  launchctl bootstrap "gui/$(id -u)" "$plist"
+  printf 'Daily backup scheduled for %02d:%02d. / 每日備份時間：%02d:%02d。\n' "$hour" "$minute" "$hour" "$minute"
+}
+
+command_unschedule() {
+  local plist="$HOME/Library/LaunchAgents/$FONTVAULT_LABEL.plist"
+  launchctl bootout "gui/$(id -u)/$FONTVAULT_LABEL" 2>/dev/null || true
+  [[ -f "$plist" ]] && rm "$plist"
+  print 'Automatic schedule removed; backups were preserved. / 自動排程已移除；備份仍保留。'
+}
+
+command_apps() {
+  ensure_repo
+  local app_file="$REPO_PATH/font-backup-data/applications/applications.md"
+  [[ -f "$app_file" ]] || die "Application inventory not found; run fontvault backup. / 找不到應用程式清單。"
+  print -r -- "$app_file"
+  sed -n '1,240p' "$app_file"
+}
+
+command_homebrew() {
+  ensure_repo
+  local brew_file="$REPO_PATH/font-backup-data/homebrew/homebrew.md"
+  [[ -f "$brew_file" ]] || die "Homebrew inventory not found; run fontvault backup. / 找不到 Homebrew 清單。"
+  print -r -- "$brew_file"
+  sed -n '1,240p' "$brew_file"
+}
+
+command_logs() {
+  local log_file="$LOG_DIR/fontvault.log"
+  if [[ "${1:-}" == "--errors" ]]; then
+    log_file="$LOG_DIR/fontvault.error.log"
+  fi
+  [[ -f "$log_file" ]] || die "Log not found / 找不到記錄: $log_file"
+  tail -n 100 "$log_file"
+}
+
+main() {
+  if (( $# == 0 )); then
+    if is_interactive; then
+      command_menu
+    else
+      usage
+    fi
+    return
+  fi
+  local command_name="$1"
+  (( $# > 0 )) && shift
+  case "$command_name" in
+    init) command_init "$@" ;;
+    setup) command_setup "$@" ;;
+    backup) command_backup "$@" ;;
+    status) command_status "$@" ;;
+    doctor) command_doctor "$@" ;;
+    restore) command_restore "$@" ;;
+    schedule) command_schedule "$@" ;;
+    unschedule) command_unschedule "$@" ;;
+    apps) command_apps "$@" ;;
+    homebrew) command_homebrew "$@" ;;
+    logs) command_logs "$@" ;;
+    version|--version|-v) print "fontvault $FONTVAULT_VERSION" ;;
+    help|--help|-h) usage ;;
+    *) print -u2 "Unknown command / 不明指令: $command_name"; usage >&2; return 2 ;;
+  esac
+}
+
+if [[ "${FONTVAULT_SOURCE_ONLY:-0}" != "1" ]]; then
+  main "$@"
+fi
+

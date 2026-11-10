@@ -1,0 +1,67 @@
+.TH FONTVAULT 1 "November 2026" "fontvault 1.0.0" "User Commands"
+.SH NAME
+fontvault \- back up macOS fonts, Homebrew packages, and application inventory
+.SH SYNOPSIS
+.B fontvault
+.I command
+[options]
+.SH DESCRIPTION
+fontvault classifies installed fonts, excludes macOS-managed and Homebrew-managed
+font binaries, backs up personal font files, and writes Homebrew and application
+inventories into a configured private Git repository.
+When run without a command on a terminal, it opens an arrow-key and Vim-key
+interactive menu. Subcommands remain available for scripts and automation.
+.SH COMMANDS
+.TP
+.B init --repo PATH
+Configure the private backup repository.
+.TP
+.B setup [--account USER] [--repo-name NAME] [--path PATH]
+Guide a new Mac through dependency checks, secure GitHub CLI authentication,
+private-repository access, cloning, and local configuration. Credentials are
+never stored in the repository.
+.TP
+.B backup
+Create a snapshot, commit changes, and push to origin.
+.TP
+.B status
+Show inventory, schedule, and Git state.
+.TP
+.B doctor
+Validate dependencies, repository configuration, authentication, and schedule.
+.TP
+.B restore [fonts|homebrew|all]
+Restore fonts and/or the saved Homebrew Brewfile. Existing-item conflicts are
+prompted interactively; non-interactive operation keeps installed items.
+.TP
+.B schedule --daily HH:MM
+Install the per-user daily LaunchAgent.
+.TP
+.B unschedule
+Remove the LaunchAgent without deleting backups.
+.TP
+.B apps
+Print the Markdown application inventory.
+.TP
+.B homebrew
+Print the Markdown Homebrew inventory.
+.TP
+.B logs [--errors]
+Show the latest automatic-backup log.
+.SH FILES
+.TP
+.I ~/.config/fontvault/config
+Per-user configuration.
+.TP
+.I ~/Library/Caches/fontvault/
+macOS system-font fingerprint cache, keyed by OS build.
+.TP
+.I ~/Library/Logs/fontvault.log
+Automatic-backup standard log.
+.SH SAFETY
+System fonts are never copied. /Library/Fonts is opt-in. A backup stops for
+unresolved Git conflicts, low temporary disk space, a 100 MB font file, or a
+remote branch that is ahead of local.
+.SH AUTHOR
+Lesterwsl
+
