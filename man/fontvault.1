@@ -1,4 +1,4 @@
-.TH FONTVAULT 1 "November 2026" "fontvault 1.0.0" "User Commands"
+.TH FONTVAULT 1 "November 2026" "fontvault 1.1.0" "User Commands"
 .SH NAME
 fontvault \- back up macOS fonts, Homebrew packages, and application inventory
 .SH SYNOPSIS
@@ -21,8 +21,10 @@ Guide a new Mac through dependency checks, secure GitHub CLI authentication,
 private-repository access, cloning, and local configuration. Credentials are
 never stored in the repository.
 .TP
-.B backup
-Create a snapshot, commit changes, and push to origin.
+.B backup [--dry-run|--local|--commit|--push] [--include-shared] [--yes]
+Show phase progress, compare the proposed snapshot with the previous backup,
+then create the selected snapshot. Interactive use asks for confirmation unless
+--yes is supplied; scheduled non-interactive backups continue automatically.
 .TP
 .B status
 Show inventory, schedule, and Git state.
@@ -61,7 +63,8 @@ Automatic-backup standard log.
 .SH SAFETY
 System fonts are never copied. /Library/Fonts is opt-in. A backup stops for
 unresolved Git conflicts, low temporary disk space, a 100 MB font file, or a
-remote branch that is ahead of local.
+remote branch that is ahead of local. Per-run temporary data and locks are
+removed when each backup finishes, including after an interrupt.
 .SH AUTHOR
 Lesterwsl
 

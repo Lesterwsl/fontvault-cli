@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-readonly FONTVAULT_VERSION="1.0.1"
+readonly FONTVAULT_VERSION="1.1.0"
 readonly FONTVAULT_LABEL="com.lesterwsl.fontvault"
 
 export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
@@ -18,6 +18,7 @@ REPO_PATH="${FONTVAULT_REPO:-}"
 INCLUDE_SHARED_FONTS=false
 BACKUP_STAGE_DIR=""
 BACKUP_LOCK_DIR=""
+BACKUP_CHANGE_COUNT=0
 MENU_RESULT=""
 MENU_STTY=""
 
@@ -39,7 +40,7 @@ fontvault — macOS font, Homebrew, and application inventory backup
 Usage:
   fontvault init --repo PATH
   fontvault setup [--account USER] [--repo-name NAME] [--path PATH]
-  fontvault backup [--dry-run|--local|--commit|--push] [--include-shared]
+  fontvault backup [--dry-run|--local|--commit|--push] [--include-shared] [--yes]
   fontvault status
   fontvault doctor
   fontvault restore [fonts|homebrew|all] [--overwrite|--skip-existing] [--shared]
@@ -97,6 +98,12 @@ sha256_file() {
   shasum -a 256 "$1" | awk '{ print $1 }'
 }
 
+progress_step() {
+  local current="$1" total="$2"
+  shift 2
+  printf '%s[%s/%s]%s %s\n' "$C_CYAN" "$current" "$total" "$C_RESET" "$*"
+}
+
 backup_lock_is_active() {
   local lock_dir="$1"
   local pid_file="$lock_dir/pid"
@@ -124,7 +131,7 @@ backup_lock_is_active() {
 
 acquire_backup_lock() {
   local lock_dir="$1"
-  local stale_dir existing_pid=""
+  local stale_dir existing_pid="" stale_pid="" stale_stage="" temp_root=""
 
   if ! mkdir "$lock_dir" 2>/dev/null; then
     if backup_lock_is_active "$lock_dir"; then
@@ -139,7 +146,20 @@ acquire_backup_lock() {
     if ! mv "$lock_dir" "$stale_dir" 2>/dev/null; then
       die "Backup lock changed while checking; try again. / 檢查期間備份鎖定已改變，請再試一次。"
     fi
-    rm -f -- "$stale_dir/pid" "$stale_dir/started_at" "$stale_dir/command"
+    [[ -r "$stale_dir/pid" ]] && stale_pid="$(<"$stale_dir/pid")"
+    [[ -r "$stale_dir/stage_dir" ]] && stale_stage="$(<"$stale_dir/stage_dir")"
+    if [[ -n "$stale_stage" ]]; then
+      temp_root="$(cd "${TMPDIR:-/tmp}" && pwd -P)"
+      stale_stage="${stale_stage:A}"
+      if [[ "$stale_pid" == <-> && "$stale_stage" == "$temp_root/fontvault.$stale_pid."* &&
+            -d "$stale_stage" && ! -L "$stale_stage" && -O "$stale_stage" ]]; then
+        rm -rf -- "$stale_stage"
+      else
+        print -u2 "Skipped an unexpected stale stage path: $stale_stage"
+        print -u2 "已略過非預期的失效暫存路徑：$stale_stage"
+      fi
+    fi
+    rm -f -- "$stale_dir/pid" "$stale_dir/started_at" "$stale_dir/command" "$stale_dir/stage_dir"
     rmdir "$stale_dir" 2>/dev/null ||
       die "Stale backup lock contains unexpected files: $stale_dir / 失效備份鎖定含有非預期檔案。"
     mkdir "$lock_dir" 2>/dev/null ||
@@ -158,7 +178,7 @@ release_backup_lock() {
   [[ -d "$lock_dir" ]] || return 0
   [[ -r "$lock_dir/pid" ]] && lock_pid="$(<"$lock_dir/pid")"
   [[ "$lock_pid" == "$$" ]] || return 0
-  rm -f -- "$lock_dir/pid" "$lock_dir/started_at" "$lock_dir/command"
+  rm -f -- "$lock_dir/pid" "$lock_dir/started_at" "$lock_dir/command" "$lock_dir/stage_dir"
   rmdir "$lock_dir" 2>/dev/null || true
 }
 
@@ -268,7 +288,7 @@ command_menu() {
       1)
         print "${C_BOLD}Backup preview / 備份預覽${C_RESET}"
         if command_backup --dry-run && prompt_yes_no 'Create, commit, and push this backup? / 建立、commit 並 push 此備份？'; then
-          command_backup || true
+          command_backup --yes || true
         else
           print 'Backup cancelled after preview. / 已在預覽後取消備份。'
         fi
@@ -616,6 +636,168 @@ write_font_report() {
   } > "$output_file"
 }
 
+normalize_font_manifest() {
+  local input_file="$1" output_file="$2"
+  : > "$output_file"
+  [[ -f "$input_file" ]] || return 0
+  awk -F '\t' 'NR > 1 { print $2 "\t" $4 }' "$input_file" | LC_ALL=C sort > "$output_file"
+}
+
+normalize_homebrew_markdown() {
+  local input_file="$1" output_file="$2"
+  : > "$output_file"
+  [[ -f "$input_file" ]] || return 0
+  awk -F '|' '
+    /^## Formulae / { kind="formula"; next }
+    /^## Casks / { kind="cask"; next }
+    /^\|/ && kind != "" {
+      name=$2; version=$3
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", name)
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", version)
+      if (name == "Name / 名稱" || name ~ /^-+$/) next
+      print kind ": " name "\t" version
+    }
+  ' "$input_file" | LC_ALL=C sort > "$output_file"
+}
+
+normalize_application_markdown() {
+  local input_file="$1" output_file="$2"
+  : > "$output_file"
+  [[ -f "$input_file" ]] || return 0
+  awk -F '|' '
+    /^\|/ {
+      name=$2; version=$3; source=$4
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", name)
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", version)
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", source)
+      if (name == "Application / 應用程式" || name ~ /^-+$/) next
+      print name "\t" version " | " source
+    }
+  ' "$input_file" | LC_ALL=C sort > "$output_file"
+}
+
+compare_key_value_files() {
+  local old_file="$1" new_file="$2" output_file="$3"
+  awk -F '\t' '
+    FILENAME == ARGV[1] {
+      key=$1; value=substr($0, index($0, "\t") + 1); old[key]=value; next
+    }
+    FILENAME == ARGV[2] {
+      key=$1; value=substr($0, index($0, "\t") + 1); new[key]=value; next
+    }
+    END {
+      for (key in new) {
+        if (!(key in old)) print "added\t" key "\t\t" new[key]
+        else if (old[key] != new[key]) print "changed\t" key "\t" old[key] "\t" new[key]
+      }
+      for (key in old) if (!(key in new)) print "removed\t" key "\t" old[key] "\t"
+    }
+  ' "$old_file" "$new_file" | LC_ALL=C sort -t $'\t' -k1,1 -k2,2 > "$output_file"
+}
+
+print_change_details() {
+  local change_file="$1" title="$2" show_values="${3:-false}"
+  local action item old_value new_value symbol shown=0 total
+  total="$(wc -l < "$change_file" | tr -d ' ')"
+  (( total > 0 )) || return 0
+  print "  $title"
+  while IFS=$'\t' read -r action item old_value new_value; do
+    (( shown >= 8 )) && break
+    case "$action" in
+      added) symbol='+' ;;
+      removed) symbol='-' ;;
+      changed) symbol='~' ;;
+      *) symbol='?' ;;
+    esac
+    if $show_values; then
+      case "$action" in
+        added) printf '    %s %s (%s)\n' "$symbol" "$item" "$new_value" ;;
+        removed) printf '    %s %s (%s)\n' "$symbol" "$item" "$old_value" ;;
+        changed) printf '    %s %s (%s → %s)\n' "$symbol" "$item" "$old_value" "$new_value" ;;
+      esac
+    else
+      printf '    %s %s\n' "$symbol" "$item"
+    fi
+    (( shown += 1 ))
+  done < "$change_file"
+  if (( total > shown )); then
+    printf '    … %d more / 其餘 %d 項\n' $(( total - shown )) $(( total - shown ))
+  fi
+}
+
+print_change_summary() {
+  local previous_dir="$1" stage_dir="$2"
+  local compare_dir="$stage_dir/.comparison"
+  local old_fonts="$compare_dir/old-fonts.tsv" new_fonts="$compare_dir/new-fonts.tsv"
+  local old_brew="$compare_dir/old-brew.tsv" new_brew="$compare_dir/new-brew.tsv"
+  local old_apps="$compare_dir/old-apps.tsv" new_apps="$compare_dir/new-apps.tsv"
+  local font_changes="$compare_dir/font-changes.tsv"
+  local brew_changes="$compare_dir/brew-changes.tsv"
+  local app_changes="$compare_dir/app-changes.tsv"
+  local generated_changes="$compare_dir/generated-changes.txt"
+  local area added removed changed generated_count old_size="0B" new_size="0B"
+
+  mkdir -p "$compare_dir"
+  normalize_font_manifest "$previous_dir/manifests/fonts.tsv" "$old_fonts"
+  normalize_font_manifest "$stage_dir/manifests/fonts.tsv" "$new_fonts"
+  normalize_homebrew_markdown "$previous_dir/homebrew/homebrew.md" "$old_brew"
+  normalize_homebrew_markdown "$stage_dir/homebrew/homebrew.md" "$new_brew"
+  normalize_application_markdown "$previous_dir/applications/applications.md" "$old_apps"
+  normalize_application_markdown "$stage_dir/applications/applications.md" "$new_apps"
+  compare_key_value_files "$old_fonts" "$new_fonts" "$font_changes"
+  compare_key_value_files "$old_brew" "$new_brew" "$brew_changes"
+  compare_key_value_files "$old_apps" "$new_apps" "$app_changes"
+
+  : > "$generated_changes"
+  for area in homebrew applications manifests; do
+    if [[ -d "$previous_dir/$area" ]]; then
+      diff -qr "$previous_dir/$area" "$stage_dir/$area" >> "$generated_changes" 2>/dev/null || true
+    elif [[ -d "$stage_dir/$area" ]]; then
+      find "$stage_dir/$area" -type f -print >> "$generated_changes"
+    fi
+  done
+  generated_count=$(( $(wc -l < "$generated_changes" | tr -d ' ') + $(wc -l < "$font_changes" | tr -d ' ') ))
+  [[ -d "$previous_dir/fonts" ]] && old_size="$(du -sh "$previous_dir/fonts" | awk '{ print $1 }')"
+  [[ -d "$stage_dir/fonts" ]] && new_size="$(du -sh "$stage_dir/fonts" | awk '{ print $1 }')"
+  BACKUP_CHANGE_COUNT="$generated_count"
+
+  print
+  print "${C_BOLD}Changes since the last backup / 與上次備份比較${C_RESET}"
+  for change_file title in \
+    "$font_changes" 'Personal fonts / 個人字型' \
+    "$brew_changes" 'Homebrew packages / Homebrew 套件' \
+    "$app_changes" 'Applications / 應用程式'; do
+    added="$(awk -F '\t' '$1 == "added" { count++ } END { print count + 0 }' "$change_file")"
+    removed="$(awk -F '\t' '$1 == "removed" { count++ } END { print count + 0 }' "$change_file")"
+    changed="$(awk -F '\t' '$1 == "changed" { count++ } END { print count + 0 }' "$change_file")"
+    printf '%s: +%s / -%s / ~%s\n' "$title" "$added" "$removed" "$changed"
+  done
+  printf 'Generated snapshot files changed / 產生的備份檔案有變更：%s\n' "$generated_count"
+  printf 'Font data size / 字型資料大小：%s → %s\n' "$old_size" "$new_size"
+
+  if (( generated_count == 0 )); then
+    print 'No changes detected. / 沒有偵測到變更。'
+  else
+    print
+    print_change_details "$font_changes" 'Font details / 字型詳情' false
+    print_change_details "$brew_changes" 'Homebrew details / Homebrew 詳情' true
+    print_change_details "$app_changes" 'Application details / 應用程式詳情' true
+  fi
+  print
+}
+
+preserve_previous_shared_snapshot() {
+  local data_dir="$1" stage_dir="$2" classification_file="$3"
+  [[ -d "$data_dir/fonts/shared" ]] || return 0
+  print 'Preserving the previous shared-font snapshot without rescanning it. / 保留上次共用字型快照，不重新掃描。'
+  mkdir -p "$stage_dir/fonts/shared"
+  rsync -a "$data_dir/fonts/shared/" "$stage_dir/fonts/shared/"
+  if [[ -f "$data_dir/manifests/fonts.tsv" ]]; then
+    awk -F '\t' 'NR > 1 && $1 == "personal" && $2 ~ /^shared\// { print }' \
+      "$data_dir/manifests/fonts.tsv" >> "$classification_file"
+  fi
+}
+
 command_backup() {
   ensure_macos
   ensure_repo
@@ -624,7 +806,7 @@ command_backup() {
   require_command jq
   require_command rsync
 
-  local dry_run=false commit_changes=true push_changes=true include_shared="$INCLUDE_SHARED_FONTS"
+  local dry_run=false commit_changes=true push_changes=true include_shared="$INCLUDE_SHARED_FONTS" assume_yes=false
   while (( $# > 0 )); do
     case "$1" in
       --dry-run) dry_run=true; commit_changes=false; push_changes=false ;;
@@ -632,8 +814,9 @@ command_backup() {
       --commit) commit_changes=true; push_changes=false ;;
       --push) commit_changes=true; push_changes=true ;;
       --include-shared) include_shared=true ;;
+      --yes) assume_yes=true ;;
       -h|--help)
-        print 'Usage: fontvault backup [--dry-run|--local|--commit|--push] [--include-shared]'
+        print 'Usage: fontvault backup [--dry-run|--local|--commit|--push] [--include-shared] [--yes]'
         return 0
         ;;
       *) die "Unknown backup option / 不明 backup 選項: $1" ;;
@@ -643,6 +826,7 @@ command_backup() {
 
   local data_dir="$REPO_PATH/font-backup-data"
   BACKUP_LOCK_DIR="$REPO_PATH/.fontvault.lock"
+  progress_step 1 9 'Checking repository and free space / 檢查 repository 與可用空間'
   if git -C "$REPO_PATH" diff --name-only --diff-filter=U | grep -q .; then
     die "Git has unresolved conflicts; resolve them before backup. / Git 尚有未解決衝突，請先處理。"
   fi
@@ -665,11 +849,20 @@ command_backup() {
   cleanup_backup() {
     [[ -n "$BACKUP_STAGE_DIR" && -d "$BACKUP_STAGE_DIR" ]] && rm -rf "$BACKUP_STAGE_DIR"
     [[ -n "$BACKUP_LOCK_DIR" ]] && release_backup_lock "$BACKUP_LOCK_DIR"
+    BACKUP_STAGE_DIR=""
+  }
+  finish_backup() {
+    cleanup_backup
+    trap - EXIT INT TERM HUP
   }
   acquire_backup_lock "$BACKUP_LOCK_DIR"
-  trap cleanup_backup EXIT INT TERM HUP
+  trap cleanup_backup EXIT
+  trap 'cleanup_backup; exit 130' INT
+  trap 'cleanup_backup; exit 143' TERM
+  trap 'cleanup_backup; exit 129' HUP
 
-  BACKUP_STAGE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/fontvault.XXXXXX")"
+  BACKUP_STAGE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/fontvault.$$.XXXXXX")"
+  printf '%s\n' "$BACKUP_STAGE_DIR" > "$BACKUP_LOCK_DIR/stage_dir"
   local stage_dir="$BACKUP_STAGE_DIR"
 
   mkdir -p \
@@ -678,6 +871,7 @@ command_backup() {
     "$stage_dir/fonts/user" \
     "$stage_dir/manifests"
 
+  progress_step 2 9 'Reading Homebrew packages and versions / 讀取 Homebrew 套件與版本'
   local metadata_json="$stage_dir/homebrew-installed.json"
   brew info --json=v2 --installed > "$metadata_json"
 
@@ -722,6 +916,7 @@ command_backup() {
   brew list --cask --versions | LC_ALL=C sort -f > "$cask_versions"
   write_homebrew_markdown "$formula_versions" "$cask_versions" "$stage_dir/homebrew/homebrew.md"
 
+  progress_step 3 9 'Identifying Homebrew-managed fonts / 辨識 Homebrew 管理的字型'
   typeset -A brew_targets_map brew_hashes system_hashes brew_app_map personal_hashes
   local target_path checksum caskroom cask_root font_file
   while IFS= read -r target_path; do
@@ -743,6 +938,7 @@ command_backup() {
     done < <(find "$cask_root" -type f -print0 2>/dev/null)
   done < "$font_casks"
 
+  progress_step 4 9 'Loading macOS system-font fingerprints / 載入 macOS 系統字型指紋'
   local system_cache
   system_cache="$(build_system_font_cache)"
   while IFS=$'\t' read -r checksum target_path; do
@@ -759,6 +955,7 @@ command_backup() {
     [[ -n "$target_path" ]] && brew_app_map[$target_path]="$token"
   done < "$app_targets"
 
+  progress_step 5 9 'Inventorying installed applications / 建立已安裝應用程式清單'
   local app_rows="$stage_dir/application-rows.tsv"
   : > "$app_rows"
   local app_root app_path resolved_path app_name app_version app_source info_plist
@@ -785,6 +982,7 @@ command_backup() {
   LC_ALL=C sort -f -u "$app_rows" -o "$app_rows"
   write_applications_markdown "$app_rows" "$stage_dir/applications/applications.md"
 
+  progress_step 6 9 'Classifying and copying personal fonts / 分類並複製個人字型'
   local classification="$stage_dir/classification.tsv"
   : > "$classification"
   local source_root destination_root source_label relative_path destination_file bytes kind
@@ -826,6 +1024,8 @@ command_backup() {
   if $include_shared; then
     mkdir -p "$stage_dir/fonts/shared"
     classify_font_root "/Library/Fonts" "$stage_dir/fonts/shared" "shared"
+  else
+    preserve_previous_shared_snapshot "$data_dir" "$stage_dir" "$classification"
   fi
   LC_ALL=C sort -u "$classification" -o "$classification"
 
@@ -835,6 +1035,7 @@ command_backup() {
   } > "$stage_dir/manifests/fonts.tsv"
   write_font_report "$classification" "$font_casks" "$system_cache" "$stage_dir/manifests/font-classification.md"
 
+  progress_step 7 9 'Validating snapshot size and reports / 驗證備份大小與報告'
   local oversized=false
   while IFS= read -r -d '' font_file; do
     bytes="$(stat -f '%z' "$font_file")"
@@ -867,11 +1068,25 @@ command_backup() {
   printf 'Shared backup size / 共用字型備份大小：%s\n' "$shared_size"
   printf 'Applications inventoried / 已列出應用程式：%s\n' "$app_count"
 
+  progress_step 8 9 'Comparing with the previous backup / 與上次備份比較'
+  print_change_summary "$data_dir" "$stage_dir"
+
   if $dry_run; then
+    progress_step 9 9 'Preview complete; nothing was written / 預覽完成，沒有寫入資料'
     print 'Dry run complete; repository unchanged. / 試跑完成；repository 未被修改。'
+    finish_backup
     return 0
   fi
 
+  if is_interactive && ! $assume_yes; then
+    if ! prompt_yes_no 'Apply these changes and continue with the selected backup action? / 套用以上變更並繼續所選備份動作？'; then
+      print 'Backup cancelled; repository unchanged. / 已取消備份；repository 沒有變更。'
+      finish_backup
+      return 2
+    fi
+  fi
+
+  progress_step 9 9 'Updating the snapshot and selected Git destination / 更新備份與所選 Git 目的地'
   mkdir -p "$data_dir/homebrew" "$data_dir/applications" "$data_dir/fonts/user" "$data_dir/manifests"
   rsync -a --delete "$stage_dir/homebrew/" "$data_dir/homebrew/"
   rsync -a --delete "$stage_dir/applications/" "$data_dir/applications/"
@@ -901,6 +1116,7 @@ command_backup() {
     if ! push_output="$(git -C "$REPO_PATH" fetch origin 2>&1)"; then
       print -u2 -r -- "$push_output"
       print -u2 'Backup is committed locally but fetch failed; retry when online. / 備份已在本機 commit，但 fetch 失敗；請連線後重試。'
+      finish_backup
       return 1
     fi
     branch_name="$(git -C "$REPO_PATH" branch --show-current)"
@@ -910,6 +1126,7 @@ command_backup() {
         print -u2 "Remote has $behind_count commit(s) not present locally; no push was attempted."
         print -u2 "遠端有 $behind_count 個本機沒有的 commit；未嘗試 push。"
         print -u2 'Review and integrate the remote changes, then run fontvault backup again.'
+        finish_backup
         return 1
       fi
     fi
@@ -917,10 +1134,12 @@ command_backup() {
       [[ -n "$push_output" ]] && print -r -- "$push_output"
     else
       print -u2 -r -- "$push_output"
+      finish_backup
       return 1
     fi
     print 'Backup pushed to origin. / 備份已推送至 origin。'
   fi
+  finish_backup
 }
 
 brewfile_existing_counts() {

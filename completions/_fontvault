@@ -39,7 +39,8 @@ _fontvault() {
         '--local[update the local snapshot without commit or push]' \
         '--commit[commit without pushing]' \
         '--push[commit and push]' \
-        '--include-shared[include /Library/Fonts]'
+        '--include-shared[include /Library/Fonts]' \
+        '--yes[accept the displayed change summary without prompting]'
       ;;
     restore)
       _arguments \
