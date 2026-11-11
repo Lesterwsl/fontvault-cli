@@ -58,8 +58,11 @@ fontvault doctor                    # validate dependencies, Git, and repository
 Every manual backup and preview reports its current phase, from environment checks through Homebrew, application, system-font, and personal-font scanning, so a longer scan does not look frozen.<br>
 每次手動備份及預覽都會顯示目前階段，包括環境檢查、Homebrew、應用程式、系統字型及個人字型掃描，因此較長的掃描不會看似停頓。
 
-Before anything is written, fontvault compares the proposed snapshot with the previous backup and reports added, removed, and changed personal fonts, Homebrew entries, and applications. It also shows the number of generated files that differ and the old/new font-data size. Details are capped on screen so large migrations remain readable.<br>
-寫入任何資料前，fontvault 會將新快照與上次備份比較，列出新增、移除及變更的個人字型、Homebrew 項目及應用程式；亦會顯示有差異的產生檔案數目，以及字型資料的新舊大小。畫面上的詳情設有數量上限，讓大型搬機清單仍然易讀。
+Before anything is written, fontvault compares the proposed snapshot with the previous backup. Personal fonts, Homebrew formulae, Homebrew casks, and applications have separate added, removed, and changed counts followed by complete, untruncated detail lists. Version changes show old → new, and font-content changes are reported by path. It also shows the number of generated files that differ and the old/new font-data size.<br>
+寫入任何資料前，fontvault 會將新快照與上次備份比較。個人字型、Homebrew formula、Homebrew cask 及應用程式會分別顯示新增、移除及變更數量，並列出完整且不截斷的詳情；版本變更會顯示舊版 → 新版，字型內容變更則按路徑列出。畫面亦會顯示有差異的產生檔案數目，以及字型資料的新舊大小。
+
+In preview output, “removed” means the item existed in the previous snapshot but is absent from the current Mac, so it would be removed from the next snapshot. Preview never uninstalls a package or deletes a font.<br>
+在預覽結果中，「移除」代表該項目存在於上次快照、但目前 Mac 已沒有，因此下次快照會把它移出清單；預覽不會解除安裝套件或刪除字型。
 
 Interactive backups ask for confirmation after this comparison. Non-interactive backup calls are rejected unless the caller explicitly supplies `--yes`. Fontvault does not install or manage background jobs; backups run only when the user or an explicitly configured external caller starts one.<br>
 互動備份會在顯示比較結果後才詢問確認；非互動備份若未明確加入 `--yes` 便會拒絕執行。Fontvault 不會安裝或管理背景工作；只有使用者或明確設定的外部呼叫端啟動時才會備份。

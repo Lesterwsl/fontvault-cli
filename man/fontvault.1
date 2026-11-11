@@ -1,4 +1,4 @@
-.TH FONTVAULT 1 "November 2026" "fontvault 1.2.0" "User Commands"
+.TH FONTVAULT 1 "November 2026" "fontvault 1.3.0" "User Commands"
 .SH NAME
 fontvault \- back up macOS fonts, Homebrew packages, and application inventory
 .SH SYNOPSIS
@@ -22,8 +22,9 @@ private-repository access, cloning, and local configuration. Credentials are
 never stored in the repository.
 .TP
 .B backup [--dry-run|--local|--commit|--push] [--include-shared] [--yes]
-Show phase progress, compare the proposed snapshot with the previous backup,
-then create the selected snapshot. Interactive use asks for confirmation unless
+Show phase progress and complete added, removed, and changed lists for personal
+fonts, Homebrew formulae, Homebrew casks, and applications before creating the
+selected snapshot. Interactive use asks for confirmation unless
 --yes is supplied. Non-interactive calls require an explicit --yes. Fontvault
 does not install or manage background jobs.
 .TP

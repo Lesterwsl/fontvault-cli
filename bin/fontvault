@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-readonly FONTVAULT_VERSION="1.2.0"
+readonly FONTVAULT_VERSION="1.3.0"
 
 export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 export GIT_TERMINAL_PROMPT=0
@@ -665,42 +665,48 @@ compare_key_value_files() {
     }
     END {
       for (key in new) {
-        if (!(key in old)) print "added\t" key "\t\t" new[key]
+        if (!(key in old)) print "added\t" key "\t" new[key] "\t" new[key]
         else if (old[key] != new[key]) print "changed\t" key "\t" old[key] "\t" new[key]
       }
-      for (key in old) if (!(key in new)) print "removed\t" key "\t" old[key] "\t"
+      for (key in old) if (!(key in new)) print "removed\t" key "\t" old[key] "\t" old[key]
     }
   ' "$old_file" "$new_file" | LC_ALL=C sort -t $'\t' -k1,1 -k2,2 > "$output_file"
 }
 
 print_change_details() {
   local change_file="$1" title="$2" show_values="${3:-false}"
-  local action item old_value new_value symbol shown=0 total
+  local action item old_value new_value symbol action_name row_action total
+  local -a actions=(added removed changed)
+  local -a action_names=('Added / 新增' 'Removed / 移除' 'Changed / 變更')
   total="$(wc -l < "$change_file" | tr -d ' ')"
   (( total > 0 )) || return 0
   print "  $title"
-  while IFS=$'\t' read -r action item old_value new_value; do
-    (( shown >= 8 )) && break
+  local index
+  for index in {1..3}; do
+    action="${actions[$index]}"
+    action_name="${action_names[$index]}"
+    total="$(awk -F '\t' -v wanted="$action" '$1 == wanted { count++ } END { print count + 0 }' "$change_file")"
+    (( total > 0 )) || continue
     case "$action" in
       added) symbol='+' ;;
       removed) symbol='-' ;;
       changed) symbol='~' ;;
       *) symbol='?' ;;
     esac
-    if $show_values; then
-      case "$action" in
-        added) printf '    %s %s (%s)\n' "$symbol" "$item" "$new_value" ;;
-        removed) printf '    %s %s (%s)\n' "$symbol" "$item" "$old_value" ;;
-        changed) printf '    %s %s (%s → %s)\n' "$symbol" "$item" "$old_value" "$new_value" ;;
-      esac
-    else
-      printf '    %s %s\n' "$symbol" "$item"
-    fi
-    (( shown += 1 ))
-  done < "$change_file"
-  if (( total > shown )); then
-    printf '    … %d more / 其餘 %d 項\n' $(( total - shown )) $(( total - shown ))
-  fi
+    printf '    %s (%s)\n' "$action_name" "$total"
+    while IFS=$'\t' read -r row_action item old_value new_value; do
+      [[ "$row_action" == "$action" ]] || continue
+      if $show_values; then
+        case "$action" in
+          added) printf '      %s %s (%s)\n' "$symbol" "$item" "$new_value" ;;
+          removed) printf '      %s %s (%s)\n' "$symbol" "$item" "$old_value" ;;
+          changed) printf '      %s %s (%s → %s)\n' "$symbol" "$item" "$old_value" "$new_value" ;;
+        esac
+      else
+        printf '      %s %s\n' "$symbol" "$item"
+      fi
+    done < "$change_file"
+  done
 }
 
 print_change_summary() {
@@ -711,6 +717,8 @@ print_change_summary() {
   local old_apps="$compare_dir/old-apps.tsv" new_apps="$compare_dir/new-apps.tsv"
   local font_changes="$compare_dir/font-changes.tsv"
   local brew_changes="$compare_dir/brew-changes.tsv"
+  local formula_changes="$compare_dir/formula-changes.tsv"
+  local cask_changes="$compare_dir/cask-changes.tsv"
   local app_changes="$compare_dir/app-changes.tsv"
   local generated_changes="$compare_dir/generated-changes.txt"
   local area added removed changed generated_count old_size="0B" new_size="0B"
@@ -725,6 +733,14 @@ print_change_summary() {
   compare_key_value_files "$old_fonts" "$new_fonts" "$font_changes"
   compare_key_value_files "$old_brew" "$new_brew" "$brew_changes"
   compare_key_value_files "$old_apps" "$new_apps" "$app_changes"
+  awk -F '\t' '$2 ~ /^formula: / {
+    item=$2; sub(/^formula: /, "", item)
+    printf "%s\t%s\t%s\t%s\n", $1, item, $3, $4
+  }' "$brew_changes" > "$formula_changes"
+  awk -F '\t' '$2 ~ /^cask: / {
+    item=$2; sub(/^cask: /, "", item)
+    printf "%s\t%s\t%s\t%s\n", $1, item, $3, $4
+  }' "$brew_changes" > "$cask_changes"
 
   : > "$generated_changes"
   for area in homebrew applications manifests; do
@@ -743,7 +759,8 @@ print_change_summary() {
   print "${C_BOLD}Changes since the last backup / 與上次備份比較${C_RESET}"
   for change_file title in \
     "$font_changes" 'Personal fonts / 個人字型' \
-    "$brew_changes" 'Homebrew packages / Homebrew 套件' \
+    "$formula_changes" 'Homebrew formulae / Homebrew formula' \
+    "$cask_changes" 'Homebrew casks / Homebrew cask' \
     "$app_changes" 'Applications / 應用程式'; do
     added="$(awk -F '\t' '$1 == "added" { count++ } END { print count + 0 }' "$change_file")"
     removed="$(awk -F '\t' '$1 == "removed" { count++ } END { print count + 0 }' "$change_file")"
@@ -752,13 +769,17 @@ print_change_summary() {
   done
   printf 'Generated snapshot files changed / 產生的備份檔案有變更：%s\n' "$generated_count"
   printf 'Font data size / 字型資料大小：%s → %s\n' "$old_size" "$new_size"
+  print 'Legend / 圖例：+ added / 新增，- removed / 移除，~ changed / 變更'
+  print 'Removed means absent from this Mac and removed from the next snapshot; preview never uninstalls or deletes anything.'
+  print '「移除」代表目前 Mac 已沒有該項目、下次快照會移出清單；預覽不會解除安裝或刪除任何內容。'
 
   if (( generated_count == 0 )); then
     print 'No changes detected. / 沒有偵測到變更。'
   else
     print
     print_change_details "$font_changes" 'Font details / 字型詳情' false
-    print_change_details "$brew_changes" 'Homebrew details / Homebrew 詳情' true
+    print_change_details "$formula_changes" 'Homebrew formula details / Homebrew formula 詳情' true
+    print_change_details "$cask_changes" 'Homebrew cask details / Homebrew cask 詳情' true
     print_change_details "$app_changes" 'Application details / 應用程式詳情' true
   fi
   print

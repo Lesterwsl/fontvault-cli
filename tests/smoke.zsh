@@ -12,7 +12,7 @@ cleanup() {
 trap cleanup EXIT INT TERM HUP
 
 zsh -n "$CLI"
-[[ "$($CLI version)" == "fontvault 1.2.0" ]]
+[[ "$($CLI version)" == "fontvault 1.3.0" ]]
 $CLI help | grep -q 'fontvault backup'
 if $CLI schedule >/dev/null 2>&1; then
   print -u2 'Removed schedule command unexpectedly succeeded.'
@@ -49,10 +49,10 @@ mkdir -p \
   "$TEST_ROOT/previous/fonts/user" "$TEST_ROOT/previous/manifests" \
   "$TEST_ROOT/proposed/homebrew" "$TEST_ROOT/proposed/applications" \
   "$TEST_ROOT/proposed/fonts/user" "$TEST_ROOT/proposed/manifests"
-printf 'category\tpath\tbytes\tsha256\npersonal\tuser/Changed.ttf\t10\told-hash\n' > "$TEST_ROOT/previous/manifests/fonts.tsv"
+printf 'category\tpath\tbytes\tsha256\npersonal\tuser/Changed.ttf\t10\told-hash\npersonal\tuser/Removed.ttf\t9\tremoved-hash\n' > "$TEST_ROOT/previous/manifests/fonts.tsv"
 printf 'category\tpath\tbytes\tsha256\npersonal\tuser/Changed.ttf\t11\tnew-hash\npersonal\tuser/Added.otf\t12\tadded-hash\n' > "$TEST_ROOT/proposed/manifests/fonts.tsv"
-printf '## Formulae (1) / Formula (1)\n\n| Name / 名稱 | Version / 版本 |\n|---|---|\n| git | 1 |\n' > "$TEST_ROOT/previous/homebrew/homebrew.md"
-printf '## Formulae (2) / Formula (2)\n\n| Name / 名稱 | Version / 版本 |\n|---|---|\n| git | 2 |\n| gh | 1 |\n' > "$TEST_ROOT/proposed/homebrew/homebrew.md"
+printf '## Formulae (2) / Formula (2)\n\n| Name / 名稱 | Version / 版本 |\n|---|---|\n| git | 1 |\n| old-formula | 1 |\n\n## Casks (1) / Cask (1)\n\n| Name / 名稱 | Version / 版本 |\n|---|---|\n| old-cask | 1 |\n' > "$TEST_ROOT/previous/homebrew/homebrew.md"
+printf '## Formulae (2) / Formula (2)\n\n| Name / 名稱 | Version / 版本 |\n|---|---|\n| git | 2 |\n| gh | 1 |\n\n## Casks (1) / Cask (1)\n\n| Name / 名稱 | Version / 版本 |\n|---|---|\n| new-cask | 2 |\n' > "$TEST_ROOT/proposed/homebrew/homebrew.md"
 printf '| Application / 應用程式 | Version / 版本 | Source / 來源 |\n|---|---|---|\n| Example | 1 | Other |\n' > "$TEST_ROOT/previous/applications/applications.md"
 printf '| Application / 應用程式 | Version / 版本 | Source / 來源 |\n|---|---|---|\n| Example | 2 | Other |\n| New App | 1 | Homebrew |\n' > "$TEST_ROOT/proposed/applications/applications.md"
 printf 'old font' > "$TEST_ROOT/previous/fonts/user/Changed.ttf"
@@ -60,12 +60,21 @@ printf 'new font' > "$TEST_ROOT/proposed/fonts/user/Changed.ttf"
 printf 'added font' > "$TEST_ROOT/proposed/fonts/user/Added.otf"
 print_change_summary "$TEST_ROOT/previous" "$TEST_ROOT/proposed" > "$TEST_ROOT/change-output.txt"
 change_output="$(<"$TEST_ROOT/change-output.txt")"
-grep -q 'Personal fonts / 個人字型: +1 / -0 / ~1' <<< "$change_output"
-grep -q 'Homebrew packages / Homebrew 套件: +1 / -0 / ~1' <<< "$change_output"
+grep -q 'Personal fonts / 個人字型: +1 / -1 / ~1' <<< "$change_output"
+grep -q 'Homebrew formulae / Homebrew formula: +1 / -1 / ~1' <<< "$change_output"
+grep -q 'Homebrew casks / Homebrew cask: +1 / -1 / ~0' <<< "$change_output"
 grep -q 'Applications / 應用程式: +1 / -0 / ~1' <<< "$change_output"
 grep -q '+ user/Added.otf' <<< "$change_output"
-grep -q 'formula: git (1 → 2)' <<< "$change_output"
+grep -q -- '- user/Removed.ttf' <<< "$change_output"
+grep -q 'git (1 → 2)' <<< "$change_output"
+grep -q -- '- old-formula (1)' <<< "$change_output"
+grep -q '+ new-cask (2)' <<< "$change_output"
+grep -q -- '- old-cask (1)' <<< "$change_output"
 grep -q 'Example (1 | Other → 2 | Other)' <<< "$change_output"
+if grep -q 'more / 其餘' <<< "$change_output"; then
+  print -u2 'Change details were unexpectedly truncated.'
+  exit 1
+fi
 (( BACKUP_CHANGE_COUNT > 0 ))
 
 mkdir -p "$TEST_ROOT/shared-previous/fonts/shared" "$TEST_ROOT/shared-previous/manifests" "$TEST_ROOT/shared-proposed"
