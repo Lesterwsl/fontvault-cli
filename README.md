@@ -50,22 +50,19 @@ fontvault homebrew                  # print the Homebrew inventory
 fontvault restore fonts             # restore Homebrew font casks and personal fonts
 fontvault restore homebrew          # install the full saved Brewfile
 fontvault restore all               # restore the Brewfile and personal fonts
-fontvault schedule --daily 03:00    # install the daily LaunchAgent
-fontvault unschedule                # remove the LaunchAgent
-fontvault logs                      # show the latest automatic-backup log
-fontvault doctor                    # validate dependencies, Git, and schedule
+fontvault doctor                    # validate dependencies, Git, and repository access
 ```
 
 ## Progress and change review / 進度與變更檢查
 
-Every backup and preview reports its current phase, from environment checks through Homebrew, application, system-font, and personal-font scanning. This output is also written to the scheduled-backup log, so a longer scan does not look frozen.<br>
-每次備份及預覽都會顯示目前階段，包括環境檢查、Homebrew、應用程式、系統字型及個人字型掃描；排程備份記錄亦會保存相同進度，因此較長的掃描不會看似停頓。
+Every manual backup and preview reports its current phase, from environment checks through Homebrew, application, system-font, and personal-font scanning, so a longer scan does not look frozen.<br>
+每次手動備份及預覽都會顯示目前階段，包括環境檢查、Homebrew、應用程式、系統字型及個人字型掃描，因此較長的掃描不會看似停頓。
 
 Before anything is written, fontvault compares the proposed snapshot with the previous backup and reports added, removed, and changed personal fonts, Homebrew entries, and applications. It also shows the number of generated files that differ and the old/new font-data size. Details are capped on screen so large migrations remain readable.<br>
 寫入任何資料前，fontvault 會將新快照與上次備份比較，列出新增、移除及變更的個人字型、Homebrew 項目及應用程式；亦會顯示有差異的產生檔案數目，以及字型資料的新舊大小。畫面上的詳情設有數量上限，讓大型搬機清單仍然易讀。
 
-Interactive backups ask for confirmation after this comparison. Use `--yes` only when the caller has already reviewed or intentionally accepts the plan. Scheduled non-interactive backups continue automatically and leave the same comparison in `fontvault logs`.<br>
-互動備份會在顯示比較結果後才詢問確認。只有呼叫端已完成檢查或明確接受計劃時才應使用 `--yes`；非互動排程備份會自動繼續，並把相同比較結果保存在 `fontvault logs`。
+Interactive backups ask for confirmation after this comparison. Non-interactive backup calls are rejected unless the caller explicitly supplies `--yes`. Fontvault does not install or manage background jobs; backups run only when the user or an explicitly configured external caller starts one.<br>
+互動備份會在顯示比較結果後才詢問確認；非互動備份若未明確加入 `--yes` 便會拒絕執行。Fontvault 不會安裝或管理背景工作；只有使用者或明確設定的外部呼叫端啟動時才會備份。
 
 ## New Mac setup / 新 Mac 設定
 

@@ -2,8 +2,7 @@
 
 set -euo pipefail
 
-readonly FONTVAULT_VERSION="1.1.0"
-readonly FONTVAULT_LABEL="com.lesterwsl.fontvault"
+readonly FONTVAULT_VERSION="1.2.0"
 
 export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 export GIT_TERMINAL_PROMPT=0
@@ -12,7 +11,6 @@ export HOMEBREW_NO_AUTO_UPDATE=1
 readonly CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/fontvault"
 readonly CONFIG_FILE="$CONFIG_DIR/config"
 readonly CACHE_DIR="${XDG_CACHE_HOME:-$HOME/Library/Caches}/fontvault"
-readonly LOG_DIR="$HOME/Library/Logs"
 
 REPO_PATH="${FONTVAULT_REPO:-}"
 INCLUDE_SHARED_FONTS=false
@@ -45,17 +43,14 @@ Usage:
   fontvault doctor
   fontvault restore [fonts|homebrew|all] [--overwrite|--skip-existing] [--shared]
                     [--non-interactive] [--upgrade-homebrew] [--yes]
-  fontvault schedule [--daily HH:MM]
-  fontvault unschedule
   fontvault apps
   fontvault homebrew
-  fontvault logs [--errors]
   fontvault version
 
 用法：
   fontvault init --repo 路徑
   fontvault backup [--dry-run|--local|--commit|--push] [--include-shared]
-  fontvault status | doctor | restore | schedule | unschedule | apps | homebrew | logs
+  fontvault status | doctor | restore | apps | homebrew
 EOF
 }
 
@@ -274,9 +269,7 @@ command_menu() {
     'Application inventory / 應用程式清單'
     'Homebrew inventory / Homebrew 清單'
     'Restore to this Mac / 還原至此 Mac'
-    'Schedule automatic backup / 設定自動備份'
     'New Mac setup and doctor / 新 Mac 設定與檢查'
-    'View logs / 查看記錄'
     'Quit / 離開'
   )
 
@@ -313,14 +306,6 @@ command_menu() {
         fi
         ;;
       7)
-        local schedule_time
-        read -r "schedule_time?Daily time / 每日時間 [03:00]: "
-        schedule_time="${schedule_time:-03:00}"
-        if prompt_yes_no "Install daily schedule at $schedule_time? / 安裝每日 $schedule_time 排程？"; then
-          command_schedule --daily "$schedule_time" || true
-        fi
-        ;;
-      8)
         if ! command_doctor; then
           print
           if prompt_yes_no 'Run guided setup? / 執行設定導引？'; then
@@ -328,14 +313,7 @@ command_menu() {
           fi
         fi
         ;;
-      9)
-        if [[ -f "$LOG_DIR/fontvault.log" ]]; then
-          command_logs || true
-        else
-          print 'No fontvault log exists yet. / 尚未有 fontvault 記錄。'
-        fi
-        ;;
-      10) return 0 ;;
+      8) return 0 ;;
     esac
     pause_for_menu
   done
@@ -824,6 +802,10 @@ command_backup() {
     shift
   done
 
+  if ! $dry_run && ! $assume_yes && ! is_interactive; then
+    die 'Non-interactive backup requires --yes; repository unchanged. / 非互動備份必須使用 --yes；repository 沒有變更。'
+  fi
+
   local data_dir="$REPO_PATH/font-backup-data"
   BACKUP_LOCK_DIR="$REPO_PATH/.fontvault.lock"
   progress_step 1 9 'Checking repository and free space / 檢查 repository 與可用空間'
@@ -1078,7 +1060,7 @@ command_backup() {
     return 0
   fi
 
-  if is_interactive && ! $assume_yes; then
+  if ! $assume_yes; then
     if ! prompt_yes_no 'Apply these changes and continue with the selected backup action? / 套用以上變更並繼續所選備份動作？'; then
       print 'Backup cancelled; repository unchanged. / 已取消備份；repository 沒有變更。'
       finish_backup
@@ -1279,21 +1261,16 @@ restore_font_tree() {
 command_status() {
   ensure_repo
   local data_dir="$REPO_PATH/font-backup-data"
-  local font_count=0 app_count=0 brew_count=0 backup_size="0B" schedule_status="not installed"
+  local font_count=0 app_count=0 brew_count=0 backup_size="0B"
   [[ -f "$data_dir/manifests/fonts.tsv" ]] && font_count="$(awk 'NR > 1 { count++ } END { print count + 0 }' "$data_dir/manifests/fonts.tsv")"
   [[ -f "$data_dir/applications/applications.md" ]] && app_count="$(grep -c '^| ' "$data_dir/applications/applications.md" | awk '{ print ($1 >= 1 ? $1 - 1 : 0) }')"
   [[ -f "$data_dir/homebrew/Brewfile.fonts" ]] && brew_count="$(grep -c '^cask ' "$data_dir/homebrew/Brewfile.fonts" || true)"
   [[ -d "$data_dir/fonts" ]] && backup_size="$(du -sh "$data_dir/fonts" | awk '{ print $1 }')"
-  if launchctl print "gui/$(id -u)/$FONTVAULT_LABEL" >/dev/null 2>&1; then
-    schedule_status="installed"
-  fi
-
   print "Repository / Repository：$REPO_PATH"
   print "Personal font files / 個人字型檔：$font_count"
   print "Homebrew font casks / Homebrew 字型套件：$brew_count"
   print "Applications / 應用程式：$app_count"
   print "Font backup size / 字型備份大小：$backup_size"
-  print "Schedule / 排程：$schedule_status"
   git -C "$REPO_PATH" status --short --branch
   if git -C "$REPO_PATH" rev-parse --verify HEAD >/dev/null 2>&1; then
     git -C "$REPO_PATH" log -1 --oneline --decorate
@@ -1305,7 +1282,7 @@ command_status() {
 command_doctor() {
   ensure_macos
   local failures=0 command_name
-  for command_name in brew git jq rsync shasum plutil launchctl; do
+  for command_name in brew git jq rsync shasum plutil; do
     if command -v "$command_name" >/dev/null 2>&1; then
       printf '✓ %s\n' "$command_name"
     else
@@ -1330,11 +1307,6 @@ command_doctor() {
     print '✓ GitHub authentication / GitHub 登入'
   else
     print '! GitHub authentication unavailable / GitHub 登入不可用'
-  fi
-  if launchctl print "gui/$(id -u)/$FONTVAULT_LABEL" >/dev/null 2>&1; then
-    print '✓ automatic schedule / 自動排程'
-  else
-    print '! automatic schedule not installed / 尚未安裝自動排程'
   fi
   (( failures == 0 )) || return 1
 }
@@ -1402,60 +1374,6 @@ command_restore() {
   print 'Restore complete. Reopen applications to refresh fonts. / 還原完成；請重新開啟應用程式。'
 }
 
-command_schedule() {
-  ensure_macos
-  ensure_repo
-  local schedule_time="03:00"
-  while (( $# > 0 )); do
-    case "$1" in
-      --daily)
-        (( $# >= 2 )) || die "--daily requires HH:MM. / --daily 需要 HH:MM。"
-        schedule_time="$2"
-        shift
-        ;;
-      *) die "Unknown schedule option / 不明 schedule 選項: $1" ;;
-    esac
-    shift
-  done
-  [[ "$schedule_time" == <0-23>:<0-59> ]] || die "Invalid time / 無效時間: $schedule_time"
-  local hour="${schedule_time%%:*}" minute="${schedule_time##*:}"
-  local plist="$HOME/Library/LaunchAgents/$FONTVAULT_LABEL.plist"
-  local program_path
-  program_path="$(command -v fontvault 2>/dev/null || true)"
-  [[ -n "$program_path" ]] || program_path="${0:A}"
-  local escaped_program escaped_log_dir
-  escaped_program="$(printf '%s' "$program_path" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g')"
-  escaped_log_dir="$(printf '%s' "$LOG_DIR" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g')"
-  mkdir -p "$HOME/Library/LaunchAgents" "$LOG_DIR"
-  cat > "$plist" <<EOF
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key><string>$FONTVAULT_LABEL</string>
-  <key>ProgramArguments</key>
-  <array><string>$escaped_program</string><string>backup</string></array>
-  <key>StartCalendarInterval</key>
-  <dict><key>Hour</key><integer>$hour</integer><key>Minute</key><integer>$minute</integer></dict>
-  <key>RunAtLoad</key><true/>
-  <key>StandardOutPath</key><string>$escaped_log_dir/fontvault.log</string>
-  <key>StandardErrorPath</key><string>$escaped_log_dir/fontvault.error.log</string>
-</dict>
-</plist>
-EOF
-  plutil -lint "$plist" >/dev/null
-  launchctl bootout "gui/$(id -u)/$FONTVAULT_LABEL" 2>/dev/null || true
-  launchctl bootstrap "gui/$(id -u)" "$plist"
-  printf 'Daily backup scheduled for %02d:%02d. / 每日備份時間：%02d:%02d。\n' "$hour" "$minute" "$hour" "$minute"
-}
-
-command_unschedule() {
-  local plist="$HOME/Library/LaunchAgents/$FONTVAULT_LABEL.plist"
-  launchctl bootout "gui/$(id -u)/$FONTVAULT_LABEL" 2>/dev/null || true
-  [[ -f "$plist" ]] && rm "$plist"
-  print 'Automatic schedule removed; backups were preserved. / 自動排程已移除；備份仍保留。'
-}
-
 command_apps() {
   ensure_repo
   local app_file="$REPO_PATH/font-backup-data/applications/applications.md"
@@ -1470,15 +1388,6 @@ command_homebrew() {
   [[ -f "$brew_file" ]] || die "Homebrew inventory not found; run fontvault backup. / 找不到 Homebrew 清單。"
   print -r -- "$brew_file"
   sed -n '1,240p' "$brew_file"
-}
-
-command_logs() {
-  local log_file="$LOG_DIR/fontvault.log"
-  if [[ "${1:-}" == "--errors" ]]; then
-    log_file="$LOG_DIR/fontvault.error.log"
-  fi
-  [[ -f "$log_file" ]] || die "Log not found / 找不到記錄: $log_file"
-  tail -n 100 "$log_file"
 }
 
 main() {
@@ -1499,11 +1408,8 @@ main() {
     status) command_status "$@" ;;
     doctor) command_doctor "$@" ;;
     restore) command_restore "$@" ;;
-    schedule) command_schedule "$@" ;;
-    unschedule) command_unschedule "$@" ;;
     apps) command_apps "$@" ;;
     homebrew) command_homebrew "$@" ;;
-    logs) command_logs "$@" ;;
     version|--version|-v) print "fontvault $FONTVAULT_VERSION" ;;
     help|--help|-h) usage ;;
     *) print -u2 "Unknown command / 不明指令: $command_name"; usage >&2; return 2 ;;

@@ -12,14 +12,23 @@ cleanup() {
 trap cleanup EXIT INT TERM HUP
 
 zsh -n "$CLI"
-[[ "$($CLI version)" == "fontvault 1.1.0" ]]
+[[ "$($CLI version)" == "fontvault 1.2.0" ]]
 $CLI help | grep -q 'fontvault backup'
+if $CLI schedule >/dev/null 2>&1; then
+  print -u2 'Removed schedule command unexpectedly succeeded.'
+  exit 1
+fi
 
 mkdir -p "$TEST_ROOT/repo"
 git -C "$TEST_ROOT/repo" init -q
 XDG_CONFIG_HOME="$TEST_ROOT/config" "$CLI" init --repo "$TEST_ROOT/repo" >/dev/null
 grep -q '^REPO_PATH=' "$TEST_ROOT/config/fontvault/config"
 XDG_CONFIG_HOME="$TEST_ROOT/config" "$CLI" status >/dev/null
+if XDG_CONFIG_HOME="$TEST_ROOT/config" "$CLI" backup --local >/dev/null 2>&1; then
+  print -u2 'Non-interactive backup unexpectedly ran without --yes.'
+  exit 1
+fi
+[[ ! -e "$TEST_ROOT/repo/.fontvault.lock" ]]
 
 FONTVAULT_SOURCE_ONLY=1 source "$CLI"
 mkdir "$TEST_ROOT/repo/.fontvault.lock"

@@ -9,11 +9,8 @@ _fontvault() {
     'status:show backup and Git status'
     'doctor:check dependencies and configuration'
     'restore:restore fonts or Homebrew packages'
-    'schedule:install the daily LaunchAgent'
-    'unschedule:remove the LaunchAgent'
     'apps:print the application inventory'
     'homebrew:print the Homebrew inventory'
-    'logs:show automatic-backup logs'
     'version:show the installed version'
   )
 
@@ -51,12 +48,6 @@ _fontvault() {
         '--upgrade-homebrew[allow Homebrew upgrades]' \
         '--yes[confirm the restore plan]' \
         '--shared[restore shared fonts]'
-      ;;
-    schedule)
-      _arguments '--daily[daily time]:time (HH\:MM):'
-      ;;
-    logs)
-      _arguments '--errors[show the error log]'
       ;;
   esac
 }

@@ -1,4 +1,4 @@
-.TH FONTVAULT 1 "November 2026" "fontvault 1.1.0" "User Commands"
+.TH FONTVAULT 1 "November 2026" "fontvault 1.2.0" "User Commands"
 .SH NAME
 fontvault \- back up macOS fonts, Homebrew packages, and application inventory
 .SH SYNOPSIS
@@ -24,32 +24,23 @@ never stored in the repository.
 .B backup [--dry-run|--local|--commit|--push] [--include-shared] [--yes]
 Show phase progress, compare the proposed snapshot with the previous backup,
 then create the selected snapshot. Interactive use asks for confirmation unless
---yes is supplied; scheduled non-interactive backups continue automatically.
+--yes is supplied. Non-interactive calls require an explicit --yes. Fontvault
+does not install or manage background jobs.
 .TP
 .B status
-Show inventory, schedule, and Git state.
+Show inventory and Git state.
 .TP
 .B doctor
-Validate dependencies, repository configuration, authentication, and schedule.
+Validate dependencies, repository configuration, and authentication.
 .TP
 .B restore [fonts|homebrew|all]
 Restore fonts and/or the saved Homebrew Brewfile. Existing-item conflicts are
 prompted interactively; non-interactive operation keeps installed items.
-.TP
-.B schedule --daily HH:MM
-Install the per-user daily LaunchAgent.
-.TP
-.B unschedule
-Remove the LaunchAgent without deleting backups.
-.TP
 .B apps
 Print the Markdown application inventory.
 .TP
 .B homebrew
 Print the Markdown Homebrew inventory.
-.TP
-.B logs [--errors]
-Show the latest automatic-backup log.
 .SH FILES
 .TP
 .I ~/.config/fontvault/config
@@ -57,9 +48,6 @@ Per-user configuration.
 .TP
 .I ~/Library/Caches/fontvault/
 macOS system-font fingerprint cache, keyed by OS build.
-.TP
-.I ~/Library/Logs/fontvault.log
-Automatic-backup standard log.
 .SH SAFETY
 System fonts are never copied. /Library/Fonts is opt-in. A backup stops for
 unresolved Git conflicts, low temporary disk space, a 100 MB font file, or a
